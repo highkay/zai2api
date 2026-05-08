@@ -25,12 +25,6 @@ type Config struct {
 	ScanLimit     int
 	LogLevel      string
 
-	// 匿名 token 池（无 TokenManager / BACKUP_TOKEN 时启用；已配置上游 token 时不使用池）
-	AnonymousPoolSize               int
-	AnonymousTokenTTLSeconds        int
-	AnonymousRefreshIntervalSeconds int
-	AnonymousFetchMaxRetries        int
-
 	// Display
 	Note []string // 多行备注，在 / 显示
 }
@@ -118,11 +112,6 @@ func LoadConfig() {
 		SkipAuthToken: getEnvBool("SKIP_AUTH_TOKEN", false),
 		ScanLimit:     getEnvInt("SCAN_LIMIT", 200000),
 		LogLevel:      getEnvString("LOG_LEVEL", "info"),
-
-		AnonymousPoolSize:               getEnvInt("ANONYMOUS_POOL_SIZE", 4),
-		AnonymousTokenTTLSeconds:        getEnvInt("ANONYMOUS_TOKEN_TTL_SECONDS", 1200),
-		AnonymousRefreshIntervalSeconds: getEnvInt("ANONYMOUS_REFRESH_INTERVAL_SECONDS", 90),
-		AnonymousFetchMaxRetries:        getEnvInt("ANONYMOUS_FETCH_MAX_RETRIES", 3),
 
 		// Display
 		Note: parseNoteLines(getEnvString("NOTE", "")),

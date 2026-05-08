@@ -91,11 +91,11 @@ func main() {
 		internal.LogError("TokenManager 启动失败: %v", err)
 	}
 
-	internal.StartAnonymousTokenPool()
 	internal.StartVersionUpdater()
 	internal.StartModelFetcher()
 	http.HandleFunc("/", corsMiddleware(loggingMiddleware(handleRoot)))
 	http.HandleFunc("/v1/models", corsMiddleware(loggingMiddleware(internal.HandleModels)))
+	http.HandleFunc("/v1/tokens", corsMiddleware(loggingMiddleware(internal.HandleTokens)))
 	http.HandleFunc("/v1/chat/completions", corsMiddleware(loggingMiddleware(internal.HandleChatCompletions)))
 	addr := ":" + internal.Cfg.Port
 	internal.LogInfo("Server starting on %s", addr)

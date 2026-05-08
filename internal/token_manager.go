@@ -3,6 +3,7 @@ package internal
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -33,6 +34,7 @@ type TokenManager struct {
 	mu              sync.RWMutex
 	tokens          map[string]*TokenInfo // token -> TokenInfo
 	validTokens     []string              // 有效 token 列表
+	fileTokens      []string              // tokens.txt 中的 token 顺序
 	currentIndex    int                   // 轮询索引
 	dataDir         string
 	watcher         *fsnotify.Watcher
@@ -48,18 +50,115 @@ var (
 	tokenOnce    sync.Once
 )
 
+var (
+	ErrNoUpstreamToken    = errors.New("no upstream token available")
+	ErrTokenNotFound      = errors.New("token not found")
+	ErrTokenAlreadyExists = errors.New("token already exists")
+)
+
+func NewTokenManager(dataDir string) *TokenManager {
+	if dataDir == "" {
+		dataDir = "data"
+	}
+	return &TokenManager{
+		tokens:        make(map[string]*TokenInfo),
+		validTokens:   make([]string, 0),
+		fileTokens:    make([]string, 0),
+		dataDir:       dataDir,
+		checkInterval: 5 * time.Minute,
+		stopChan:      make(chan struct{}),
+	}
+}
+
 // GetTokenManager 获取单例 TokenManager
 func GetTokenManager() *TokenManager {
 	tokenOnce.Do(func() {
-		tokenManager = &TokenManager{
-			tokens:        make(map[string]*TokenInfo),
-			validTokens:   make([]string, 0),
-			dataDir:       "data",
-			checkInterval: 5 * time.Minute, // 每5分钟检查一次
-			stopChan:      make(chan struct{}),
-		}
+		tokenManager = NewTokenManager("data")
 	})
 	return tokenManager
+}
+
+func normalizeTokenValue(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if strings.HasPrefix(raw, "token=") {
+		raw = strings.TrimSpace(strings.TrimPrefix(raw, "token="))
+	}
+	return raw
+}
+
+func cloneTokenInfo(info *TokenInfo) TokenInfo {
+	if info == nil {
+		return TokenInfo{}
+	}
+	return TokenInfo{
+		Token:       info.Token,
+		Email:       info.Email,
+		UserID:      info.UserID,
+		Valid:       info.Valid,
+		LastChecked: info.LastChecked,
+		UseCount:    info.UseCount,
+	}
+}
+
+func (tm *TokenManager) tokenFilePath() string {
+	return filepath.Join(tm.dataDir, "tokens.txt")
+}
+
+func (tm *TokenManager) invalidTokenFilePath() string {
+	return filepath.Join(tm.dataDir, "tokens_invalid.txt")
+}
+
+func (tm *TokenManager) readTokenEntriesFromFile() ([]string, error) {
+	file, err := os.Open(tm.tokenFilePath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []string{}, nil
+		}
+		return nil, err
+	}
+	defer file.Close()
+
+	var tokens []string
+	seen := make(map[string]bool)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		token := normalizeTokenValue(scanner.Text())
+		if token == "" || seen[token] || strings.HasPrefix(strings.TrimSpace(scanner.Text()), "#") {
+			continue
+		}
+		seen[token] = true
+		tokens = append(tokens, token)
+	}
+	return tokens, scanner.Err()
+}
+
+func (tm *TokenManager) writeTokenEntries(tokens []string) error {
+	if err := os.MkdirAll(tm.dataDir, 0755); err != nil {
+		return err
+	}
+
+	content := "# 用户 Token 文件（自动更新）\n"
+	content += "# 兼容历史格式：读取时支持 token=...、空行和注释行\n"
+	content += fmt.Sprintf("# 更新时间: %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
+	content += strings.Join(tokens, "\n")
+	if len(tokens) > 0 {
+		content += "\n"
+	}
+	return os.WriteFile(tm.tokenFilePath(), []byte(content), 0644)
+}
+
+func normalizeTokenInputs(rawTokens []string) []string {
+	var tokens []string
+	seen := make(map[string]bool)
+	for _, raw := range rawTokens {
+		token := normalizeTokenValue(raw)
+		if token == "" || seen[token] {
+			continue
+		}
+		seen[token] = true
+		tokens = append(tokens, token)
+	}
+	return tokens
 }
 
 // Start 启动 token 管理器
@@ -96,13 +195,17 @@ func (tm *TokenManager) Stop() {
 
 // loadTokens 从 data 目录加载所有 token
 func (tm *TokenManager) loadTokens() error {
-	tokenFile := filepath.Join(tm.dataDir, "tokens.txt")
+	tokenFile := tm.tokenFilePath()
 
 	file, err := os.Open(tokenFile)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// 创建示例文件
 			tm.createExampleTokenFile(tokenFile)
+			tm.mu.Lock()
+			tm.tokens = make(map[string]*TokenInfo)
+			tm.validTokens = make([]string, 0)
+			tm.fileTokens = make([]string, 0)
+			tm.mu.Unlock()
 			return nil
 		}
 		return err
@@ -116,23 +219,26 @@ func (tm *TokenManager) loadTokens() error {
 	oldTokens := tm.tokens
 	tm.tokens = make(map[string]*TokenInfo)
 	tm.validTokens = make([]string, 0)
+	tm.fileTokens = make([]string, 0)
 
+	seen := make(map[string]bool)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+		line := scanner.Text()
+		trimmedLine := strings.TrimSpace(line)
+		if trimmedLine == "" || strings.HasPrefix(trimmedLine, "#") {
 			continue
 		}
 
-		token := line
-		// 支持 token=xxx 格式
-		if strings.HasPrefix(line, "token=") {
-			token = strings.TrimPrefix(line, "token=")
-		}
-
+		token := normalizeTokenValue(line)
 		if token == "" {
 			continue
 		}
+		if seen[token] {
+			continue
+		}
+		seen[token] = true
+		tm.fileTokens = append(tm.fileTokens, token)
 
 		// 复用旧的 TokenInfo 如果存在
 		if oldInfo, exists := oldTokens[token]; exists {
@@ -159,14 +265,15 @@ func (tm *TokenManager) loadTokens() error {
 	validN := len(tm.validTokens)
 	LogInfo("已加载 %d 个 token", validN)
 	scanErr := scanner.Err()
-	if validN > 0 {
-		invalidateAnonymousPoolSlots()
-	}
 	return scanErr
 }
 
 // createExampleTokenFile 创建示例 token 文件
 func (tm *TokenManager) createExampleTokenFile(path string) {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		LogWarn("创建示例 token 文件目录失败: %v", err)
+		return
+	}
 	content := `# 用户 Token 文件
 # 每行一个 token，支持以下格式：
 # 1. 直接写 token
@@ -341,7 +448,11 @@ func (tm *TokenManager) rebuildValidTokens() {
 	defer tm.mu.Unlock()
 
 	tm.validTokens = make([]string, 0)
-	for token, info := range tm.tokens {
+	for _, token := range tm.fileTokens {
+		info, exists := tm.tokens[token]
+		if !exists {
+			continue
+		}
 		if info.Valid {
 			tm.validTokens = append(tm.validTokens, token)
 		}
@@ -353,8 +464,7 @@ func (tm *TokenManager) removeInvalidTokens() {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	tokenFile := filepath.Join(tm.dataDir, "tokens.txt")
-	invalidFile := filepath.Join(tm.dataDir, "tokens_invalid.txt")
+	invalidFile := tm.invalidTokenFilePath()
 
 	// 收集失效 token
 	var invalidTokens []string
@@ -385,16 +495,203 @@ func (tm *TokenManager) removeInvalidTokens() {
 		validTokenLines = append(validTokenLines, token)
 	}
 
-	content := "# 用户 Token 文件（自动更新）\n"
-	content += fmt.Sprintf("# 更新时间: %s\n", time.Now().Format("2006-01-02 15:04:05"))
-	content += "# 失效 token 已移至 tokens_invalid.txt\n\n"
-	content += strings.Join(validTokenLines, "\n")
-	if len(validTokenLines) > 0 {
-		content += "\n"
+	tm.fileTokens = append([]string(nil), validTokenLines...)
+	if err := tm.writeTokenEntries(validTokenLines); err != nil {
+		LogError("重写 token 文件失败: %v", err)
+	}
+	LogInfo("已移除 %d 个失效 token 到 %s", len(invalidTokens), invalidFile)
+}
+
+func (tm *TokenManager) ListTokens() []TokenInfo {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	result := make([]TokenInfo, 0, len(tm.fileTokens))
+	for _, token := range tm.fileTokens {
+		info, exists := tm.tokens[token]
+		if !exists {
+			continue
+		}
+		result = append(result, cloneTokenInfo(info))
+	}
+	return result
+}
+
+func (tm *TokenManager) GetTokenInfo(token string) (TokenInfo, bool) {
+	token = normalizeTokenValue(token)
+	if token == "" {
+		return TokenInfo{}, false
 	}
 
-	os.WriteFile(tokenFile, []byte(content), 0644)
-	LogInfo("已移除 %d 个失效 token 到 %s", len(invalidTokens), invalidFile)
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	info, exists := tm.tokens[token]
+	if !exists {
+		return TokenInfo{}, false
+	}
+	return cloneTokenInfo(info), true
+}
+
+func (tm *TokenManager) AddTokens(rawTokens []string) ([]TokenInfo, []string, error) {
+	requestedTokens := normalizeTokenInputs(rawTokens)
+	if len(requestedTokens) == 0 {
+		return nil, nil, fmt.Errorf("token is required")
+	}
+
+	tm.mu.Lock()
+	fileTokens, err := tm.readTokenEntriesFromFile()
+	if err != nil {
+		tm.mu.Unlock()
+		return nil, nil, err
+	}
+
+	existing := make(map[string]bool, len(fileTokens))
+	for _, token := range fileTokens {
+		existing[token] = true
+	}
+
+	var addedTokens []string
+	var skippedTokens []string
+	for _, token := range requestedTokens {
+		if existing[token] {
+			skippedTokens = append(skippedTokens, token)
+			continue
+		}
+		existing[token] = true
+		fileTokens = append(fileTokens, token)
+		addedTokens = append(addedTokens, token)
+	}
+
+	if len(addedTokens) > 0 {
+		err = tm.writeTokenEntries(fileTokens)
+	}
+	tm.mu.Unlock()
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(addedTokens) == 0 {
+		return []TokenInfo{}, skippedTokens, nil
+	}
+	if err := tm.loadTokens(); err != nil {
+		return nil, nil, err
+	}
+
+	result := make([]TokenInfo, 0, len(addedTokens))
+	for _, token := range addedTokens {
+		if info, exists := tm.GetTokenInfo(token); exists {
+			result = append(result, info)
+		}
+	}
+	return result, skippedTokens, nil
+}
+
+func (tm *TokenManager) UpdateToken(oldToken, newToken string) (TokenInfo, error) {
+	oldToken = normalizeTokenValue(oldToken)
+	newToken = normalizeTokenValue(newToken)
+	if oldToken == "" || newToken == "" {
+		return TokenInfo{}, fmt.Errorf("old_token and new_token are required")
+	}
+
+	tm.mu.Lock()
+	fileTokens, err := tm.readTokenEntriesFromFile()
+	if err != nil {
+		tm.mu.Unlock()
+		return TokenInfo{}, err
+	}
+
+	index := -1
+	for i, token := range fileTokens {
+		if token == oldToken {
+			index = i
+			break
+		}
+	}
+	if index == -1 {
+		tm.mu.Unlock()
+		return TokenInfo{}, ErrTokenNotFound
+	}
+	if oldToken != newToken {
+		for _, token := range fileTokens {
+			if token == newToken {
+				tm.mu.Unlock()
+				return TokenInfo{}, ErrTokenAlreadyExists
+			}
+		}
+		fileTokens[index] = newToken
+		if err := tm.writeTokenEntries(fileTokens); err != nil {
+			tm.mu.Unlock()
+			return TokenInfo{}, err
+		}
+	}
+	tm.mu.Unlock()
+
+	if err := tm.loadTokens(); err != nil {
+		return TokenInfo{}, err
+	}
+	info, exists := tm.GetTokenInfo(newToken)
+	if !exists {
+		return TokenInfo{}, ErrTokenNotFound
+	}
+	return info, nil
+}
+
+func (tm *TokenManager) DeleteToken(token string) (TokenInfo, error) {
+	token = normalizeTokenValue(token)
+	if token == "" {
+		return TokenInfo{}, fmt.Errorf("token is required")
+	}
+
+	deletedInfo, exists := tm.GetTokenInfo(token)
+	if !exists {
+		deletedInfo = TokenInfo{Token: token}
+	}
+
+	tm.mu.Lock()
+	fileTokens, err := tm.readTokenEntriesFromFile()
+	if err != nil {
+		tm.mu.Unlock()
+		return TokenInfo{}, err
+	}
+
+	index := -1
+	for i, item := range fileTokens {
+		if item == token {
+			index = i
+			break
+		}
+	}
+	if index == -1 {
+		tm.mu.Unlock()
+		return TokenInfo{}, ErrTokenNotFound
+	}
+
+	fileTokens = append(fileTokens[:index], fileTokens[index+1:]...)
+	if err := tm.writeTokenEntries(fileTokens); err != nil {
+		tm.mu.Unlock()
+		return TokenInfo{}, err
+	}
+	tm.mu.Unlock()
+
+	if err := tm.loadTokens(); err != nil {
+		return TokenInfo{}, err
+	}
+	return deletedInfo, nil
+}
+
+func GetUpstreamToken() string {
+	if token := GetTokenManager().GetToken(); token != "" {
+		return token
+	}
+	return GetBackupToken()
+}
+
+func GetUpstreamTokenForModelAPI() (string, error) {
+	token := GetUpstreamToken()
+	if token == "" {
+		return "", ErrNoUpstreamToken
+	}
+	return token, nil
 }
 
 // HasValidUpstreamTokens 是否存在可用的 z.ai 上游 token（TokenManager 轮询用）

@@ -1,0 +1,307 @@
+# zai2api Agent Notes
+
+## 项目定位
+
+`zai2api` 是一个用 Go 实现的 OpenAI 兼容代理层。它把外部客户端发来的 OpenAI 风格请求转换成 z.ai Web 侧实际使用的请求格式，再把上游返回的 SSE/JSON 重新整理为 OpenAI SDK 可消费的响应。
+
+本文档只描述主代理服务本身：HTTP 入口、请求转换、上游转发、响应适配、模型系统和运行配置。任何非主代理链路的历史辅助代码都不作为这里的项目主线。
+
+## 主要功能
+
+- 提供 OpenAI 兼容接口：
+  - `GET /`
+  - `GET /v1/models`
+  - `GET/POST/PUT/DELETE /v1/tokens`
+  - `POST /v1/chat/completions`
+- 兼容流式和非流式聊天补全返回
+- 将 OpenAI `messages` 转换为 z.ai Web 上游消息格式
+- 支持模型映射、思考模式、搜索模式和动态模型同步
+- 支持工具调用适配：把 OpenAI tools 注入为提示协议，再将模型输出提取回 OpenAI `tool_calls`
+- 支持图片/视频输入：先上传到 z.ai 文件接口，再把文件 ID 回填到上游消息
+- 支持基于 `data/tokens.txt` 的 token 管理 API
+- 维护遥测、日志、请求重试和基础服务状态输出
+
+## 技术栈
+
+- 语言：Go `1.25`
+- HTTP 服务：标准库 `net/http`
+- 上游 HTTP/TLS 指纹模拟：
+  - `github.com/bogdanfinn/tls-client`
+  - `github.com/bogdanfinn/fhttp`
+- 配置加载：`github.com/joho/godotenv`
+- 文件监听：`github.com/fsnotify/fsnotify`
+- ID 生成：`github.com/google/uuid`
+- CI：GitHub Actions，按 `linux/windows/darwin` 和 `amd64/arm64` 交叉构建
+
+## 关键文件
+
+- `cmd/main.go`
+  - 服务入口
+  - 初始化配置、日志、上游 token 管理、前端版本同步、模型同步
+  - 注册 `/`、`/v1/models`、`/v1/tokens`、`/v1/chat/completions`
+- `internal/chat.go`
+  - 主请求处理入口 `HandleChatCompletions`
+  - 上游请求构造 `makeUpstreamRequest`
+  - 流式/非流式响应适配
+  - `/v1/models` 的处理函数 `HandleModels`
+- `internal/token_api.go`
+  - `tokens.txt` 的增删改查 API
+- `internal/models.go`
+  - OpenAI 请求结构和响应结构定义
+  - 消息内容解析
+  - 多模态消息转上游消息
+- `internal/model_fetcher.go`
+  - 内置模型映射
+  - z.ai 模型列表拉取
+  - 动态模型注册与后缀扩展
+- `internal/tools.go`
+  - tools 提示注入
+  - assistant/tool 消息改写
+  - 工具调用结果提取与回填
+- `internal/upload.go`
+  - 图片/视频下载、base64 解析、上传到 z.ai 文件接口
+- `internal/tls_http.go`
+  - 统一 TLS 指纹和浏览器请求头
+- `internal/version.go`
+  - 抓取 z.ai 前端版本，给上游请求补 `X-FE-Version`
+- `internal/config.go`
+  - `.env` 配置加载
+- `internal/token_manager.go`
+  - 上游 token 加载、校验、轮询和统计
+- `internal/telemetry.go`
+  - 请求量和 token 用量统计
+
+## 启动流程
+
+服务启动入口在 `cmd/main.go`，顺序是：
+
+1. `LoadConfig()` 读取 `.env`
+2. `InitLogger()` 初始化日志
+3. `GetTokenManager().Start()` 启动上游 token 管理器
+4. `StartVersionUpdater()` 定时抓取 z.ai 前端版本号
+5. `StartModelFetcher()` 初始化内置模型并周期拉取最新模型列表
+6. 注册 HTTP 路由和中间件
+7. `http.ListenAndServe(":"+Cfg.Port, nil)` 启动服务
+
+## 核心代码流程
+
+### 1. 客户端请求进入
+
+`POST /v1/chat/completions` 由 `internal.HandleChatCompletions` 处理。
+
+处理顺序：
+
+1. 校验请求方法必须为 `POST`
+2. 从 `Authorization: Bearer ...` 读取客户端 API Key
+3. 按 `AUTH_TOKEN` / `SKIP_AUTH_TOKEN` 规则做 OpenAI 风格鉴权
+4. 取一个当前可用的上游 z.ai token
+   - 优先 `data/tokens.txt`
+   - 其次 `BACKUP_TOKEN`
+   - 如果两者都没有，直接返回 `503 upstream_token_unavailable`
+5. 解析请求体为 `ChatRequest`
+6. 补默认模型 `GLM-4.6`
+7. 通过 `IsValidModel` / `GetUpstreamConfig` 校验模型是否可用
+8. 从 `messages` 中提取图片和视频 URL，识别是否是多模态请求
+9. 如果传入 `tools`，先经 `ProcessMessagesWithTools` 注入工具协议
+10. 统计输入 token，生成本次 completion ID
+11. 带重试地调用 `makeUpstreamRequest`
+12. 根据 `stream` 分流到：
+  - `handleStreamResponseWithRetry`
+  - `handleNonStreamResponseWithRetry`
+13. 记录 telemetry 和 token 调用结果
+
+### 2. OpenAI 请求转 z.ai Web 请求
+
+`makeUpstreamRequest` 是核心桥接逻辑。
+
+它会：
+
+1. 解析上游 token 的 JWT，取出 `user_id`
+2. 生成：
+  - `chat_id`
+  - `request_id`
+  - `user_msg_id`
+  - `timestamp`
+3. 基于请求模型查 `GetUpstreamConfig`，得到：
+  - 实际上游模型 ID
+  - 是否开启 thinking
+  - 是否开启自动搜索
+  - 需要附带的 `mcp_servers`
+4. 从最新 user 消息提取文本，生成 `X-Signature`
+5. 拼出上游 URL：
+  - 默认 `API_ENDPOINT=https://chat.z.ai/api/v2/chat/completions`
+  - query 中附带 `timestamp`、`requestId`、`user_id`、`token`、`current_url`、`pathname` 等 Web 侧参数
+6. 若消息包含图片/视频：
+  - 调 `UploadImages` / `UploadVideos`
+  - 先把媒体上传到 `https://chat.z.ai/api/v1/files/`
+  - 建立 `原始 URL -> z.ai file ID` 映射
+7. 调每条消息的 `ToUpstreamMessage`，把 OpenAI 内容改成上游可接受结构
+8. 组装最终 JSON body：
+  - `stream`
+  - `model`
+  - `messages`
+  - `signature_prompt`
+  - `features`
+  - `mcp_servers`
+  - `files`
+  - `current_user_message_id`
+9. 给请求补充 z.ai Web 所需头：
+  - `Authorization`
+  - `X-FE-Version`
+  - `X-Signature`
+  - `Origin`
+  - `Referer`
+  - 浏览器 UA / `sec-ch-ua`
+  - `X-Forwarded-For`
+  - `X-Real-IP`
+10. 通过 `TLSHTTPClient()` 发送请求，保持浏览器风格 TLS/HTTP2 指纹
+
+### 3. 流式响应适配
+
+上游返回的是 SSE。`handleStreamResponse` 会逐行扫描 `data: ...` 事件，并把它改写成 OpenAI chunk。
+
+关键适配逻辑：
+
+1. 先发一个带 `delta.role=assistant` 的首块
+2. 解析上游 `phase`
+3. `thinking` 阶段：
+  - 过滤和拼接思考内容
+  - 输出到 OpenAI 扩展字段 `reasoning_content`
+4. `answer` 阶段：
+  - 把 `delta_content` 或 `edit_content` 转成普通 `content`
+5. 搜索结果 / 图片搜索 / MCP 片段：
+  - 转成 Markdown 引用或可读文本
+6. 如果本次启用了 `tools`：
+  - 不立即把正文直接发给客户端
+  - 等全量内容拼完后运行 `ExtractToolInvocations`
+  - 将识别出的调用转成 OpenAI `tool_calls` chunk
+7. 最后发送：
+  - 带 `finish_reason` 的结束块
+  - 可选 usage 块
+  - `data: [DONE]`
+
+### 4. 非流式响应适配
+
+非流式路径会消费完整上游 SSE，再汇总成单个 OpenAI JSON：
+
+- `object=chat.completion`
+- `choices[0].message.content`
+- `choices[0].message.reasoning_content`
+- `choices[0].message.tool_calls`
+- `usage`
+- `system_fingerprint`
+
+## 模型系统
+
+模型能力由两层组成：
+
+1. `internal/model_fetcher.go` 内置一批稳定映射
+2. 启动后访问 `https://chat.z.ai/api/models` 拉取最新模型并补充动态映射
+
+模型对外暴露时会自动扩展后缀变体：
+
+- `-thinking`
+- `-search`
+- `-thinking-search`
+
+因此，`/v1/models` 返回的是“基础模型 + 动态模型 + 后缀变体”的合集，而不是手写死表。
+
+## 工具调用实现方式
+
+这里的 tools 不是直接透传给 z.ai 原生函数调用接口，而是兼容层方案：
+
+1. `GenerateToolPrompt` 把 OpenAI tool schema 注入到 system 指令
+2. `ProcessMessagesWithTools` 把历史 assistant/tool 消息改写为模型可理解的文本协议
+3. 模型输出后，`ExtractToolInvocations` 从 XML / JSON / 内联函数格式里提取调用
+4. 代理层再把它包装回 OpenAI `tool_calls`
+
+改这部分时，必须同时检查：
+
+- 流式 `tool_calls` chunk 输出
+- 非流式 `message.tool_calls`
+- `tool_choice=none/auto/required`
+
+## 多模态实现方式
+
+图片和视频不会直接把原 URL 交给上游。
+
+真实流程是：
+
+1. 从 OpenAI `messages[].content[]` 中找出 `image_url` / `video_url`
+2. 支持两类输入：
+  - 普通 URL
+  - `data:` base64
+3. 下载或解码文件
+4. 上传到 z.ai 文件接口
+5. 把返回的文件 ID 回填到消息内容
+6. 在上游请求体里附带 `files`
+
+所以，任何多模态问题都应同时检查：
+
+- 输入内容解析
+- 文件下载/解码
+- 文件上传
+- URL 与 file ID 映射
+- 上游消息回填
+
+## 重要配置
+
+主代理链路常用配置：
+
+- `PORT`
+- `API_ENDPOINT`
+- `AUTH_TOKEN`
+- `BACKUP_TOKEN`
+- `DEBUG_LOGGING`
+- `TOOL_SUPPORT`
+- `RETRY_COUNT`
+- `SKIP_AUTH_TOKEN`
+- `SCAN_LIMIT`
+- `LOG_LEVEL`
+- `NOTE`
+
+补充说明：
+
+- 当前仓库不再包含匿名 token 获取逻辑
+- 当前仓库不再包含自动注册/自动发号逻辑
+
+## 修改注意事项
+
+1. 这是一个“协议转换器”，不能只看本地结构，必须同时守住两侧契约：
+   - 下游 OpenAI SDK 兼容性
+   - 上游 z.ai Web 请求形态
+2. 修改聊天主链路时，优先检查这些文件是否一起受影响：
+   - `internal/chat.go`
+   - `internal/models.go`
+   - `internal/model_fetcher.go`
+   - `internal/tools.go`
+   - `internal/upload.go`
+   - `internal/tls_http.go`
+   - `internal/version.go`
+3. 改 streaming 逻辑时，必须同步验证：
+   - reasoning 内容
+   - 普通 content
+   - tool_calls
+   - usage chunk
+   - `[DONE]`
+4. 改模型映射时，必须同时检查：
+   - `IsValidModel`
+   - `GetUpstreamConfig`
+   - `/v1/models` 输出
+   - thinking/search 后缀行为
+5. 改媒体逻辑时，不要只改消息解析；上传接口、`files` 结构和回填映射必须一起验证
+6. 改上游请求头或 TLS 逻辑时，`X-FE-Version`、`X-Signature`、浏览器指纹头和 `TLSHTTPClient()` 需要一起看，不能只改单点
+
+## 构建与验证
+
+- 本地构建主程序：
+  - `go build ./cmd`
+- 运行全部测试：
+  - `go test ./...`
+- Docker Compose 启动：
+  - `docker compose up --build -d`
+- CI 构建入口：
+  - `.github/workflows/build.yml`
+  - `.github/workflows/release-tag.yml`
+
+如果未来新增接口或重写主链路，更新本文件时应继续围绕“OpenAI 兼容代理”这条主线，不要把非主服务历史路径重新写回项目总说明。

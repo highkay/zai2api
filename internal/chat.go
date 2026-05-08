@@ -458,46 +458,18 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	apiKey := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-
-	// API Key 认证
-	if !Cfg.SkipAuthToken {
-		if apiKey == "" {
-			LogDebug("Missing Authorization header")
-			writeError(w, http.StatusUnauthorized, ErrTypeAuthentication, "Missing or invalid Authorization header", "invalid_api_key")
-			return
-		}
-		// 验证 API Key
-		if !ValidateAuthToken(apiKey) {
-			LogDebug("Invalid API key: %s...", apiKey[:min(8, len(apiKey))])
-			writeError(w, http.StatusUnauthorized, ErrTypeAuthentication, "Invalid API key", "invalid_api_key")
-			return
-		}
-		LogDebug("API key validated: %s...", apiKey[:min(8, len(apiKey))])
-	} else {
-		LogDebug("SKIP_AUTH_TOKEN enabled, skipping API key validation")
+	if !requireAPIKey(w, r) {
+		return
 	}
 	clientIP := GetClientIP(r)
 	isMultimodal := false
 
 	var token string
-	// 优先使用 TokenManager 中的 token
-	if tmToken := GetTokenManager().GetToken(); tmToken != "" {
-		token = tmToken
-		LogDebug("Using token from TokenManager")
-	} else if backupToken := GetBackupToken(); backupToken != "" {
-		token = backupToken
-		LogDebug("Using backup token")
-	} else {
-		anonymousToken, err := GetAnonymousToken()
-		if err != nil {
-			LogError("Failed to get anonymous token: %v", err)
-			GetTokenManager().RecordCall(false, false)
-			writeErrorResponse(w, http.StatusInternalServerError)
-			return
-		}
-		token = anonymousToken
-		LogDebug("Using anonymous token: %s...", token[:min(10, len(token))])
+	if token = GetUpstreamToken(); token == "" {
+		LogError("No upstream token available")
+		GetTokenManager().RecordCall(false, false)
+		writeError(w, http.StatusServiceUnavailable, ErrTypeServer, "No upstream token available", "upstream_token_unavailable")
+		return
 	}
 
 	var req ChatRequest

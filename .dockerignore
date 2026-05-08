@@ -1,0 +1,14 @@
+.git
+.github
+.vscode
+.idea
+data
+dist
+build
+bin
+*.exe
+*.dll
+*.so
+*.dylib
+*.log
+.env
