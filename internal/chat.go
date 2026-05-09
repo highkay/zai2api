@@ -3,11 +3,14 @@ package internal
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -120,7 +123,13 @@ func extractAllMediaURLs(messages []Message) (imageURLs, videoURLs []string) {
 	return imageURLs, videoURLs
 }
 
-func makeUpstreamRequest(token string, messages []Message, model string, imageURLs, videoURLs []string, hasTools bool) (*fhttp.Response, string, error) {
+var makeUpstreamRequestFunc = makeUpstreamRequest
+
+func makeUpstreamRequest(ctx context.Context, token string, messages []Message, model string, imageURLs, videoURLs []string, hasTools bool) (*fhttp.Response, string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	payload, err := DecodeJWTPayload(token)
 	if err != nil || payload == nil {
 		return nil, "", fmt.Errorf("invalid token")
@@ -189,7 +198,10 @@ func makeUpstreamRequest(token string, messages []Message, model string, imageUR
 	// 上传图片
 	if len(imageURLs) > 0 {
 		LogDebug("[Upstream] Uploading %d images...", len(imageURLs))
-		imageFiles, _ := UploadImages(token, imageURLs)
+		imageFiles, err := UploadImages(ctx, token, imageURLs)
+		if err != nil {
+			return nil, "", err
+		}
 		LogDebug("[Upstream] Image upload result: %d files", len(imageFiles))
 		for i, f := range imageFiles {
 			if i < len(imageURLs) {
@@ -214,7 +226,10 @@ func makeUpstreamRequest(token string, messages []Message, model string, imageUR
 	// 上传视频
 	if len(videoURLs) > 0 {
 		LogDebug("[Upstream] Uploading %d videos...", len(videoURLs))
-		videoFiles, _ := UploadVideos(token, videoURLs)
+		videoFiles, err := UploadVideos(ctx, token, videoURLs)
+		if err != nil {
+			return nil, "", err
+		}
 		LogDebug("[Upstream] Video upload result: %d files", len(videoFiles))
 		for i, f := range videoFiles {
 			if i < len(videoURLs) {
@@ -273,7 +288,7 @@ func makeUpstreamRequest(token string, messages []Message, model string, imageUR
 
 	bodyBytes, _ := json.Marshal(body)
 
-	req, err := fhttp.NewRequest("POST", url, bytes.NewReader(bodyBytes))
+	req, err := fhttp.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, "", err
 	}
@@ -314,15 +329,36 @@ type UpstreamData struct {
 		Phase        string `json:"phase"`
 		Done         bool   `json:"done"`
 		Error        *struct {
-			Code   string `json:"code"`
-			Detail string `json:"detail"`
+			Code    interface{} `json:"code"`
+			Detail  string      `json:"detail"`
+			ModelID string      `json:"model_id,omitempty"`
 		} `json:"error,omitempty"`
 	} `json:"data"`
 }
 
 // HasError 检查上游响应是否包含错误
 func (u *UpstreamData) HasError() bool {
-	return u.Data.Error != nil && u.Data.Error.Code != ""
+	return u.GetErrorCode() != ""
+}
+
+// GetErrorCode 获取上游错误码（兼容 string / number）
+func (u *UpstreamData) GetErrorCode() string {
+	if u.Data.Error == nil || u.Data.Error.Code == nil {
+		return ""
+	}
+	switch code := u.Data.Error.Code.(type) {
+	case string:
+		return strings.TrimSpace(code)
+	case float64:
+		if code == float64(int64(code)) {
+			return strconv.FormatInt(int64(code), 10)
+		}
+		return strconv.FormatFloat(code, 'f', -1, 64)
+	case json.Number:
+		return code.String()
+	default:
+		return strings.TrimSpace(fmt.Sprint(code))
+	}
 }
 
 // GetErrorMessage 获取错误信息
@@ -333,7 +369,7 @@ func (u *UpstreamData) GetErrorMessage() string {
 	if u.Data.Error.Detail != "" {
 		return u.Data.Error.Detail
 	}
-	return u.Data.Error.Code
+	return u.GetErrorCode()
 }
 
 // UpstreamResult 上游请求结果
@@ -341,11 +377,37 @@ type UpstreamResult struct {
 	Success         bool
 	HasContent      bool
 	ResponseStarted bool
+	ErrorCode       string
 	ErrorMessage    string
 	OutputTokens    int64
 }
 
 const RetryableErr = "INTERNAL_ERROR"
+
+func isContextCanceled(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func classifyNonRetryableUpstreamError(errorCode, errorMessage string) (statusCode int, responseCode string, ok bool) {
+	normalizedCode := strings.ToUpper(strings.TrimSpace(errorCode))
+	normalizedMessage := strings.ToLower(strings.TrimSpace(errorMessage))
+
+	switch normalizedCode {
+	case "429", "MODEL_CONCURRENCY_LIMIT", "RATE_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS":
+		return http.StatusTooManyRequests, "rate_limit_exceeded", true
+	case RetryableErr:
+		return 0, "", false
+	}
+
+	switch {
+	case strings.Contains(normalizedMessage, "current concurrent conversation limit"),
+		strings.Contains(normalizedMessage, "currently at capacity"),
+		strings.Contains(normalizedMessage, "too many requests"):
+		return http.StatusTooManyRequests, "rate_limit_exceeded", true
+	default:
+		return 0, "", false
+	}
+}
 
 func (u *UpstreamData) GetEditContent() string {
 	editContent := u.Data.EditContent
@@ -461,8 +523,14 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !requireAPIKey(w, r) {
 		return
 	}
+	ctx := r.Context()
 	clientIP := GetClientIP(r)
 	isMultimodal := false
+
+	if err := ctx.Err(); err != nil {
+		LogInfo("Client request canceled before upstream token selection: %v", err)
+		return
+	}
 
 	var token string
 	if token = GetUpstreamToken(); token == "" {
@@ -528,6 +596,11 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 重试循环
 	maxRetries := max(Cfg.RetryCount, 0)
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			LogInfo("Client request canceled during chat processing: %v", err)
+			return
+		}
+
 		if attempt > 0 {
 			// 重试时获取新 token
 			if newToken := GetTokenManager().GetToken(); newToken != "" && newToken != token {
@@ -538,8 +611,12 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		resp, modelName, err := makeUpstreamRequest(token, messages, req.Model, reqImageURLs, reqVideoURLs, len(req.Tools) > 0)
+		resp, modelName, err := makeUpstreamRequestFunc(ctx, token, messages, req.Model, reqImageURLs, reqVideoURLs, len(req.Tools) > 0)
 		if err != nil {
+			if isContextCanceled(err) || isContextCanceled(ctx.Err()) {
+				LogInfo("Client request canceled during upstream request: %v", err)
+				return
+			}
 			LogError("Upstream request failed (attempt %d): %v", attempt+1, err)
 			lastError = err.Error()
 			continue
@@ -572,6 +649,14 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		if result.Success && result.HasContent {
 			success = true
 			break
+		}
+
+		if statusCode, responseCode, stopRetry := classifyNonRetryableUpstreamError(result.ErrorCode, result.ErrorMessage); stopRetry {
+			GetTokenManager().RecordCall(false, isMultimodal)
+			if !result.ResponseStarted {
+				writeError(w, statusCode, ErrTypeUpstream, result.ErrorMessage, responseCode)
+			}
+			return
 		}
 
 		// 检查是否需要重试
@@ -1348,6 +1433,7 @@ func handleStreamResponseWithRetry(w http.ResponseWriter, body io.ReadCloser, co
 			continue
 		}
 		if upstream.HasError() {
+			result.ErrorCode = upstream.GetErrorCode()
 			upstreamError = upstream.GetErrorMessage()
 			LogError("Upstream error: %s", upstreamError)
 			result.Success = false
@@ -1722,6 +1808,12 @@ func handleStreamResponseWithRetry(w http.ResponseWriter, body io.ReadCloser, co
 		}
 	}
 
+	if err := scanner.Err(); err != nil {
+		result.Success = false
+		result.ErrorMessage = err.Error()
+		return result
+	}
+
 	if !hasContent {
 		result.OutputTokens = outputTokens
 		result.ErrorMessage = "empty response"
@@ -1809,6 +1901,7 @@ func handleNonStreamResponseWithRetry(w http.ResponseWriter, body io.ReadCloser,
 
 		// 检测上游错误
 		if upstream.HasError() {
+			result.ErrorCode = upstream.GetErrorCode()
 			upstreamError = upstream.GetErrorMessage()
 			LogError("Upstream error: %s", upstreamError)
 			result.Success = false
@@ -1911,6 +2004,12 @@ func handleNonStreamResponseWithRetry(w http.ResponseWriter, body io.ReadCloser,
 		if content != "" {
 			chunks = append(chunks, content)
 		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		result.Success = false
+		result.ErrorMessage = err.Error()
+		return result
 	}
 
 	fullContent := strings.Join(chunks, "")

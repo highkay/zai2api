@@ -2,6 +2,7 @@ package internal
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -170,7 +171,11 @@ func isValidMediaMagicBytes(data []byte) bool {
 	return false
 }
 
-func downloadFromURL(url string) (data []byte, contentType string, filename string, err error) {
+func downloadFromURL(ctx context.Context, url string) (data []byte, contentType string, filename string, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	urlPreview := url
 	if len(urlPreview) > 80 {
 		urlPreview = urlPreview[:80] + "..."
@@ -183,7 +188,7 @@ func downloadFromURL(url string) (data []byte, contentType string, filename stri
 		return nil, "", "", ErrRequestFailed
 	}
 
-	req, err := fhttp.NewRequest("GET", url, nil)
+	req, err := fhttp.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		LogError("[Download] create request error: %v", err)
 		return nil, "", "", ErrRequestFailed
@@ -196,6 +201,9 @@ func downloadFromURL(url string) (data []byte, contentType string, filename stri
 
 	resp, err := client.Do(req)
 	if err != nil {
+		if isContextCanceled(err) {
+			return nil, "", "", err
+		}
 		LogError("[Download] request error: %v", err)
 		return nil, "", "", ErrRequestFailed
 	}
@@ -234,7 +242,11 @@ func downloadFromURL(url string) (data []byte, contentType string, filename stri
 }
 
 // uploadToZAI 上传文件到 z.ai
-func uploadToZAI(token string, data []byte, filename string, contentType string) (*FileUploadResponse, error) {
+func uploadToZAI(ctx context.Context, token string, data []byte, filename string, contentType string) (*FileUploadResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	LogDebug("[UploadToZAI] Preparing request: filename=%s, contentType=%s, dataSize=%d", filename, contentType, len(data))
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
@@ -260,7 +272,7 @@ func uploadToZAI(token string, data []byte, filename string, contentType string)
 	}
 	writer.Close()
 
-	req, err := fhttp.NewRequest("POST", "https://chat.z.ai/api/v1/files/", &buf)
+	req, err := fhttp.NewRequestWithContext(ctx, "POST", "https://chat.z.ai/api/v1/files/", &buf)
 	if err != nil {
 		LogError("create request error: %v", err)
 		return nil, ErrRequestFailed
@@ -295,6 +307,9 @@ func uploadToZAI(token string, data []byte, filename string, contentType string)
 
 	resp, err := client.Do(req)
 	if err != nil {
+		if isContextCanceled(err) {
+			return nil, err
+		}
 		LogError("upload request error: %v", err)
 		return nil, ErrRequestFailed
 	}
@@ -338,7 +353,7 @@ func isUnsupportedMediaURL(url string) bool {
 }
 
 // UploadMedia 通用媒体上传（支持图片和视频，支持 base64 和 URL）
-func UploadMedia(token string, mediaURL string, mediaType MediaType) (*UpstreamFile, error) {
+func UploadMedia(ctx context.Context, token string, mediaURL string, mediaType MediaType) (*UpstreamFile, error) {
 	var fileData []byte
 	var filename string
 	var contentType string
@@ -378,7 +393,7 @@ func UploadMedia(token string, mediaURL string, mediaType MediaType) (*UpstreamF
 	} else {
 		// 从 URL 下载
 		var err error
-		fileData, contentType, filename, err = downloadFromURL(mediaURL)
+		fileData, contentType, filename, err = downloadFromURL(ctx, mediaURL)
 		if err != nil {
 			LogDebug("[Upload] URL download failed: %v", err)
 			return nil, err
@@ -408,7 +423,7 @@ func UploadMedia(token string, mediaURL string, mediaType MediaType) (*UpstreamF
 
 	// 上传到 z.ai
 	LogDebug("[Upload] Uploading to z.ai: filename=%s, contentType=%s, size=%d bytes", filename, contentType, len(fileData))
-	uploadResp, err := uploadToZAI(token, fileData, filename, contentType)
+	uploadResp, err := uploadToZAI(ctx, token, fileData, filename, contentType)
 	if err != nil {
 		LogDebug("[Upload] Upload to z.ai failed: %v", err)
 		return nil, err
@@ -430,23 +445,26 @@ func UploadMedia(token string, mediaURL string, mediaType MediaType) (*UpstreamF
 }
 
 // UploadImageFromURL 从 URL 或 base64 上传图片到 z.ai
-func UploadImageFromURL(token string, imageURL string) (*UpstreamFile, error) {
-	return UploadMedia(token, imageURL, MediaTypeImage)
+func UploadImageFromURL(ctx context.Context, token string, imageURL string) (*UpstreamFile, error) {
+	return UploadMedia(ctx, token, imageURL, MediaTypeImage)
 }
 
 // UploadVideoFromURL 从 URL 或 base64 上传视频到 z.ai
-func UploadVideoFromURL(token string, videoURL string) (*UpstreamFile, error) {
-	return UploadMedia(token, videoURL, MediaTypeVideo)
+func UploadVideoFromURL(ctx context.Context, token string, videoURL string) (*UpstreamFile, error) {
+	return UploadMedia(ctx, token, videoURL, MediaTypeVideo)
 }
 
 // UploadImages 批量上传图片
-func UploadImages(token string, imageURLs []string) ([]*UpstreamFile, error) {
+func UploadImages(ctx context.Context, token string, imageURLs []string) ([]*UpstreamFile, error) {
 	LogDebug("[UploadImages] Starting batch upload: count=%d", len(imageURLs))
 	var files []*UpstreamFile
 	for i, url := range imageURLs {
 		LogDebug("[UploadImages] Uploading image %d/%d", i+1, len(imageURLs))
-		file, err := UploadImageFromURL(token, url)
+		file, err := UploadImageFromURL(ctx, token, url)
 		if err != nil {
+			if isContextCanceled(err) {
+				return nil, err
+			}
 			LogError("upload image failed: %s - %v", url[:min(50, len(url))], err)
 			continue
 		}
@@ -462,13 +480,16 @@ func UploadImages(token string, imageURLs []string) ([]*UpstreamFile, error) {
 }
 
 // UploadVideos 批量上传视频
-func UploadVideos(token string, videoURLs []string) ([]*UpstreamFile, error) {
+func UploadVideos(ctx context.Context, token string, videoURLs []string) ([]*UpstreamFile, error) {
 	LogDebug("[UploadVideos] Starting batch upload: count=%d", len(videoURLs))
 	var files []*UpstreamFile
 	for i, url := range videoURLs {
 		LogDebug("[UploadVideos] Uploading video %d/%d", i+1, len(videoURLs))
-		file, err := UploadVideoFromURL(token, url)
+		file, err := UploadVideoFromURL(ctx, token, url)
 		if err != nil {
+			if isContextCanceled(err) {
+				return nil, err
+			}
 			LogError("upload video failed: %s - %v", url[:min(50, len(url))], err)
 			continue
 		}
@@ -484,8 +505,8 @@ func UploadVideos(token string, videoURLs []string) ([]*UpstreamFile, error) {
 }
 
 // UploadMediaFiles 批量上传媒体文件（图片+视频）
-func UploadMediaFiles(token string, imageURLs, videoURLs []string) ([]*UpstreamFile, []*UpstreamFile, error) {
-	images, _ := UploadImages(token, imageURLs)
-	videos, _ := UploadVideos(token, videoURLs)
+func UploadMediaFiles(ctx context.Context, token string, imageURLs, videoURLs []string) ([]*UpstreamFile, []*UpstreamFile, error) {
+	images, _ := UploadImages(ctx, token, imageURLs)
+	videos, _ := UploadVideos(ctx, token, videoURLs)
 	return images, videos, nil
 }
