@@ -129,6 +129,8 @@ func makeUpstreamRequest(ctx context.Context, token string, messages []Message, 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	requestCtx, cancel := deriveCancelableRequestContext(ctx)
+	defer cancel()
 
 	payload, err := DecodeJWTPayload(token)
 	if err != nil || payload == nil {
@@ -198,7 +200,7 @@ func makeUpstreamRequest(ctx context.Context, token string, messages []Message, 
 	// 上传图片
 	if len(imageURLs) > 0 {
 		LogDebug("[Upstream] Uploading %d images...", len(imageURLs))
-		imageFiles, err := UploadImages(ctx, token, imageURLs)
+		imageFiles, err := UploadImages(requestCtx, token, imageURLs)
 		if err != nil {
 			return nil, "", err
 		}
@@ -226,7 +228,7 @@ func makeUpstreamRequest(ctx context.Context, token string, messages []Message, 
 	// 上传视频
 	if len(videoURLs) > 0 {
 		LogDebug("[Upstream] Uploading %d videos...", len(videoURLs))
-		videoFiles, err := UploadVideos(ctx, token, videoURLs)
+		videoFiles, err := UploadVideos(requestCtx, token, videoURLs)
 		if err != nil {
 			return nil, "", err
 		}
@@ -288,7 +290,7 @@ func makeUpstreamRequest(ctx context.Context, token string, messages []Message, 
 
 	bodyBytes, _ := json.Marshal(body)
 
-	req, err := fhttp.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
+	req, err := fhttp.NewRequestWithContext(requestCtx, "POST", url, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, "", err
 	}
@@ -386,6 +388,32 @@ const RetryableErr = "INTERNAL_ERROR"
 
 func isContextCanceled(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func deriveCancelableRequestContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		return context.WithCancel(context.Background())
+	}
+
+	var (
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
+	if deadline, ok := parent.Deadline(); ok {
+		ctx, cancel = context.WithDeadline(context.Background(), deadline)
+	} else {
+		ctx, cancel = context.WithCancel(context.Background())
+	}
+
+	go func() {
+		select {
+		case <-parent.Done():
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	return ctx, cancel
 }
 
 func classifyNonRetryableUpstreamError(errorCode, errorMessage string) (statusCode int, responseCode string, ok bool) {
