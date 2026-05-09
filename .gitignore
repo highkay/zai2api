@@ -48,3 +48,4 @@ debug/
 # Temporary files
 *.tmp
 *.temp
+.ace-tool/
