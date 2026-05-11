@@ -181,7 +181,7 @@ func TestHandleChatCompletionsWithoutUpstreamToken(t *testing.T) {
 	tokenOnce.Do(func() {})
 
 	body := map[string]interface{}{
-		"model": "GLM-4.6",
+		"model": "GLM-5.1",
 		"messages": []map[string]string{
 			{"role": "user", "content": "hello"},
 		},

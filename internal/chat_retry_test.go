@@ -58,11 +58,11 @@ func TestHandleChatCompletionsStopsRetryingOnUpstreamConcurrencyLimit(t *testing
 		return &fhttp.Response{
 			StatusCode: http.StatusOK,
 			Body:       io.NopCloser(bytes.NewBufferString(sse)),
-		}, "GLM-4.6", nil
+		}, "GLM-5.1", nil
 	}
 
 	body := map[string]interface{}{
-		"model": "GLM-4.6",
+		"model": "GLM-5.1",
 		"messages": []map[string]string{
 			{"role": "user", "content": "hello"},
 		},
@@ -185,7 +185,7 @@ func TestHandleChatCompletionsRefreshesTokenAfterUpstreamAuthFailure(t *testing.
 			return &fhttp.Response{
 				StatusCode: http.StatusUnauthorized,
 				Body:       io.NopCloser(bytes.NewBufferString(`{"error":{"message":"expired"}}`)),
-			}, "GLM-4.6", nil
+			}, "GLM-5.1", nil
 		}
 		if token != "fresh.one.two" {
 			t.Fatalf("expected refreshed token on second attempt, got %s", token)
@@ -196,11 +196,11 @@ func TestHandleChatCompletionsRefreshesTokenAfterUpstreamAuthFailure(t *testing.
 		return &fhttp.Response{
 			StatusCode: http.StatusOK,
 			Body:       io.NopCloser(bytes.NewBufferString(sse)),
-		}, "GLM-4.6", nil
+		}, "GLM-5.1", nil
 	}
 
 	body := map[string]interface{}{
-		"model": "GLM-4.6",
+		"model": "GLM-5.1",
 		"messages": []map[string]string{
 			{"role": "user", "content": "hello"},
 		},

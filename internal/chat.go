@@ -163,7 +163,7 @@ func makeUpstreamRequest(ctx context.Context, token string, messages []Message, 
 		LogDebug("Using fallback model mapping: %s -> %s", model, targetModel)
 	}
 
-	if targetModel == "glm-4.5v" || targetModel == "glm-4.6v" {
+	if isVisionModelID(strings.ToLower(targetModel)) {
 		autoWebSearch = false
 	}
 
@@ -575,7 +575,7 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Model == "" {
-		req.Model = "GLM-4.6"
+		req.Model = "GLM-5.1"
 	}
 
 	// 验证模型是否存在

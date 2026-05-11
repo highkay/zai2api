@@ -101,7 +101,7 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-api-key" \
   -d '{
-    "model": "GLM-4.5",
+    "model": "GLM-5.1",
     "messages": [{"role": "user", "content": "Hello!"}],
     "stream": true
   }'
@@ -162,7 +162,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="GLM-4.5",
+    model="GLM-5.1",
     messages=[{"role": "user", "content": "Hello!"}]
 )
 print(response.choices[0].message.content)
@@ -171,26 +171,14 @@ print(response.choices[0].message.content)
 ## 支持的模型
 
 - 启动后会从云端拉取最新模型列表，并自动补充到 `/v1/models`
-- 当前模型列表可按基础模型分组理解，大多数基础模型会自动提供以下后缀变体：
+- 当前只保留 `GLM-5`、`GLM-5V`、`GLM-5.1` 系列；旧的 `4.x` 系列不会再对外暴露
+- 大多数基础模型会自动提供以下后缀变体：
   `-thinking`、`-search`、`-thinking-search`
 - 当前已返回的基础模型包括：
-  `GLM-4.5`
-  `GLM-4.5-Search`
-  `GLM-4.5-V`
-  `GLM-4.5-Air`
-  `GLM-4.6`
-  `GLM-4.6-Thinking`
-  `GLM-4.6-Search`
-  `GLM-4.6-V`
-  `GLM-4.7`
   `GLM-5`
   `GLM-5-Turbo`
   `GLM-5v-Turbo`
   `GLM-5.1`
-  `glm-4.6v`
-  `glm-4-flash`
-  `glm-4-air-250414`
-  `GLM-4.1V-Thinking-FlashX`
 
 ## 项目结构
 
