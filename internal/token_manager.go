@@ -1058,6 +1058,10 @@ func (tm *TokenManager) GetStats() TokenManagerStats {
 	if total > 0 {
 		successRate = float64(success) / float64(total) * 100
 	}
+	failed := total - success
+	if failed < 0 {
+		failed = 0
+	}
 
 	return TokenManagerStats{
 		ValidTokenCount: len(tm.validTokens),
@@ -1065,6 +1069,7 @@ func (tm *TokenManager) GetStats() TokenManagerStats {
 		MultimodalCount: multimodal,
 		TotalCalls:      total,
 		SuccessCalls:    success,
+		FailedCalls:     failed,
 		SuccessRate:     successRate,
 	}
 }
@@ -1076,6 +1081,7 @@ type TokenManagerStats struct {
 	MultimodalCount int64   `json:"multimodal_count"`
 	TotalCalls      int64   `json:"total_calls"`
 	SuccessCalls    int64   `json:"success_calls"`
+	FailedCalls     int64   `json:"failed_calls"`
 	SuccessRate     float64 `json:"success_rate"`
 }
 

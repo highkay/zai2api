@@ -147,3 +147,21 @@ func TestTokenManagerLoadsBackupTokensIntoPool(t *testing.T) {
 		t.Fatalf("backup token should not be marked refreshed before use: %+v", info)
 	}
 }
+
+func TestTokenManagerStatsIncludesFailedCalls(t *testing.T) {
+	tm := NewTokenManager(t.TempDir())
+
+	tm.RecordCall(true, false)
+	tm.RecordCall(false, true)
+
+	stats := tm.GetStats()
+	if stats.TotalCalls != 2 || stats.SuccessCalls != 1 || stats.FailedCalls != 1 {
+		t.Fatalf("unexpected call stats: %+v", stats)
+	}
+	if stats.MultimodalCount != 1 {
+		t.Fatalf("unexpected multimodal count: %+v", stats)
+	}
+	if stats.SuccessRate != 50 {
+		t.Fatalf("unexpected success rate: %+v", stats)
+	}
+}

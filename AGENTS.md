@@ -10,6 +10,7 @@
 
 - 提供 OpenAI 兼容接口：
   - `GET /`
+  - `GET /console`
   - `GET /v1/models`
   - `GET/POST/PUT/DELETE /v1/tokens`
   - `POST /v1/chat/completions`
@@ -18,7 +19,8 @@
 - 支持模型映射、思考模式、搜索模式和动态模型同步
 - 支持工具调用适配：把 OpenAI tools 注入为提示协议，再将模型输出提取回 OpenAI `tool_calls`
 - 支持图片/视频输入：先上传到 z.ai 文件接口，再把文件 ID 回填到上游消息
-- 支持基于 `data/tokens.txt` 的 token 管理 API
+- 支持基于 `data/tokens.txt` 的 token 管理 API，并通过 `/api/v1/auths/` 滚动刷新 z.ai bearer
+- 提供精简 `/console` 控制台，展示调用统计、成功/失败数量、模型统计和文件 token 管理
 - 维护遥测、日志、请求重试和基础服务状态输出
 
 ## 技术栈
@@ -38,7 +40,10 @@
 - `cmd/main.go`
   - 服务入口
   - 初始化配置、日志、上游 token 管理、前端版本同步、模型同步
-  - 注册 `/`、`/v1/models`、`/v1/tokens`、`/v1/chat/completions`
+  - 注册 `/`、`/console`、`/v1/models`、`/v1/tokens`、`/v1/chat/completions`
+- `internal/console.go`
+  - 返回无构建步骤的控制台单页 HTML
+  - 页面复用 `/` 遥测数据和 `/v1/tokens` 受保护 CRUD API
 - `internal/chat.go`
   - 主请求处理入口 `HandleChatCompletions`
   - 上游请求构造 `makeUpstreamRequest`
@@ -99,7 +104,7 @@
    - 其次 `BACKUP_TOKEN`
    - 如果两者都没有，直接返回 `503 upstream_token_unavailable`
 5. 解析请求体为 `ChatRequest`
-6. 补默认模型 `GLM-4.6`
+6. 补默认模型 `GLM-5.1`
 7. 通过 `IsValidModel` / `GetUpstreamConfig` 校验模型是否可用
 8. 从 `messages` 中提取图片和视频 URL，识别是否是多模态请求
 9. 如果传入 `tools`，先经 `ProcessMessagesWithTools` 注入工具协议
@@ -195,8 +200,8 @@
 
 模型能力由两层组成：
 
-1. `internal/model_fetcher.go` 内置一批稳定映射
-2. 启动后访问 `https://chat.z.ai/api/models` 拉取最新模型并补充动态映射
+1. `internal/model_fetcher.go` 内置 `GLM-5`、`GLM-5-Turbo`、`GLM-5v-Turbo`、`GLM-5.1`
+2. 启动后访问 `https://chat.z.ai/api/models` 拉取最新模型，并只补充 `glm-5*` 家族动态映射
 
 模型对外暴露时会自动扩展后缀变体：
 
@@ -204,7 +209,26 @@
 - `-search`
 - `-thinking-search`
 
-因此，`/v1/models` 返回的是“基础模型 + 动态模型 + 后缀变体”的合集，而不是手写死表。
+因此，`/v1/models` 返回的是“GLM-5 家族基础模型 + GLM-5 家族动态模型 + 后缀变体”的合集。旧的 `4.x` 系列不会再对外暴露。
+
+## 控制台
+
+`GET /console` 返回内置单页控制台，不需要额外前端构建。它只复用现有后端状态源：
+
+- `/`：服务状态、总调用数、成功/失败调用数、成功率、RPM、token 用量、模型维度统计
+- `/v1/tokens`：文件 token 的列表、批量新增和删除
+
+控制台页面本身公开可访问，但 token 管理请求仍走 `AUTH_TOKEN` / `SKIP_AUTH_TOKEN` 规则。页面中的 `AUTH_TOKEN` 只保存在当前浏览器 `localStorage`，后端不新增控制台会话、数据库或 cookie。
+
+## 上游 Token 刷新
+
+Z.ai bearer 被当作可滚动续签的会话凭证处理：
+
+1. `TokenManager` 加载 `data/tokens.txt` 和 `BACKUP_TOKEN` 到同一个内存池。
+2. 定时或鉴权失败时调用 `GET https://chat.z.ai/api/v1/auths/`。
+3. 如果返回新 token，就替换内存中的旧 token；文件来源 token 还会持久化回 `data/tokens.txt`。
+4. 临时网络失败只记录检查时间和日志，不删除 token。
+5. 只有明确的 `401/403` 会把 token 标为失效并从文件池移出。
 
 ## 工具调用实现方式
 
@@ -291,6 +315,7 @@
    - thinking/search 后缀行为
 5. 改媒体逻辑时，不要只改消息解析；上传接口、`files` 结构和回填映射必须一起验证
 6. 改上游请求头或 TLS 逻辑时，`X-FE-Version`、`X-Signature`、浏览器指纹头和 `TLSHTTPClient()` 需要一起看，不能只改单点
+7. 改控制台时，不要新增独立状态源；优先复用 `/` 遥测和 `/v1/tokens`，并保持 token 本体在页面上遮罩显示
 
 ## 构建与验证
 

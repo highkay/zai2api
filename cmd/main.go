@@ -69,9 +69,11 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 			"avg_input_tokens":    telemetry.AvgInputTok,
 			"avg_output_tokens":   telemetry.AvgOutputTok,
 			"valid_tokens":        telemetry.ValidTokens,
+			"total_tokens":        telemetry.TotalTokens,
 			"multimodal_calls":    telemetry.MultimodalCalls,
 			"total_calls":         telemetry.TotalCalls,
 			"success_calls":       telemetry.SuccessCalls,
+			"failed_calls":        telemetry.FailedCalls,
 			"success_rate":        telemetry.SuccessRate,
 			"model_stats":         telemetry.ModelStats,
 		},
@@ -94,6 +96,8 @@ func main() {
 	internal.StartVersionUpdater()
 	internal.StartModelFetcher()
 	http.HandleFunc("/", corsMiddleware(loggingMiddleware(handleRoot)))
+	http.HandleFunc("/console", corsMiddleware(loggingMiddleware(internal.HandleConsole)))
+	http.HandleFunc("/console/", corsMiddleware(loggingMiddleware(internal.HandleConsole)))
 	http.HandleFunc("/v1/models", corsMiddleware(loggingMiddleware(internal.HandleModels)))
 	http.HandleFunc("/v1/tokens", corsMiddleware(loggingMiddleware(internal.HandleTokens)))
 	http.HandleFunc("/v1/chat/completions", corsMiddleware(loggingMiddleware(internal.HandleChatCompletions)))
