@@ -102,6 +102,17 @@ const consoleHTML = `<!doctype html>
     }
     .section-title { margin: 0; font-size: 16px; text-transform: uppercase; }
     .hint { color: var(--muted); font-size: 12px; }
+    .auth-banner {
+      margin-top: 14px;
+      padding: 12px 14px;
+      border: 1px solid rgba(18, 107, 78, 0.28);
+      border-left: 5px solid var(--accent);
+      border-radius: 6px;
+      background: rgba(18, 107, 78, 0.08);
+      color: var(--ink);
+      font-size: 13px;
+    }
+    .auth-banner.hidden { display: none; }
     .actions { display: flex; gap: 8px; flex-wrap: wrap; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { padding: 10px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; }
@@ -129,10 +140,13 @@ const consoleHTML = `<!doctype html>
         <div class="subtitle"><span id="health-dot" class="status-dot"></span><span id="health-text">loading</span></div>
       </div>
       <div class="auth">
-        <input id="api-key" type="password" autocomplete="off" placeholder="AUTH_TOKEN">
+        <input id="api-key" type="password" autocomplete="off" placeholder="Paste AUTH_TOKEN to unlock token management">
         <button id="save-key" type="button">Save Key</button>
       </div>
     </header>
+    <div id="auth-banner" class="auth-banner">
+      Token management is locked. Paste the server AUTH_TOKEN and click Save Key. Metrics stay visible, but token list/add/delete require Authorization.
+    </div>
 
     <section class="grid">
       <div class="panel span-3"><div class="metric-label">Total Calls</div><div id="total-calls" class="metric-value">0</div></div>
@@ -194,6 +208,7 @@ const consoleHTML = `<!doctype html>
     $("save-key").addEventListener("click", () => {
       state.key = $("api-key").value.trim();
       localStorage.setItem("zai2api_console_key", state.key);
+      setAuthState();
       loadAll();
     });
     $("reload").addEventListener("click", loadAll);
@@ -223,6 +238,14 @@ const consoleHTML = `<!doctype html>
 
     function authHeaders() {
       return state.key ? { "Authorization": "Bearer " + state.key } : {};
+    }
+
+    function setAuthState() {
+      const hasKey = Boolean(state.key);
+      $("auth-banner").classList.toggle("hidden", hasKey);
+      $("add-tokens").disabled = !hasKey;
+      $("new-tokens").disabled = !hasKey;
+      $("mutation-status").textContent = hasKey ? "" : "AUTH_TOKEN required before adding tokens";
     }
 
     async function requestJSON(url, options = {}) {
@@ -285,7 +308,7 @@ const consoleHTML = `<!doctype html>
       const error = $("token-error");
       error.textContent = "";
       if (!state.key) {
-        error.textContent = "enter AUTH_TOKEN to manage tokens";
+        error.textContent = "AUTH_TOKEN required - paste the key above and click Save Key";
         renderTokens([]);
         return;
       }
@@ -302,7 +325,7 @@ const consoleHTML = `<!doctype html>
         const cell = row.insertCell();
         cell.colSpan = 6;
         cell.className = "hint";
-        cell.textContent = "no file-backed tokens";
+        cell.textContent = state.key ? "no file-backed tokens" : "locked until AUTH_TOKEN is saved";
         return;
       }
       tokens.forEach((item, index) => {
@@ -391,6 +414,7 @@ const consoleHTML = `<!doctype html>
       }
     }
 
+    setAuthState();
     loadAll();
     setInterval(loadAll, 15000);
   </script>
