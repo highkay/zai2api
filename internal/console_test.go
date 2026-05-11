@@ -38,3 +38,17 @@ func TestHandleConsoleRejectsNonGET(t *testing.T) {
 		t.Fatalf("expected 400, got %d", rec.Code)
 	}
 }
+
+func TestHandleConsoleAllowsHEADProbe(t *testing.T) {
+	req := httptest.NewRequest(http.MethodHead, "/console", nil)
+	rec := httptest.NewRecorder()
+
+	HandleConsole(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("expected empty HEAD response body, got %q", rec.Body.String())
+	}
+}

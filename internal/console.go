@@ -398,8 +398,8 @@ const consoleHTML = `<!doctype html>
 </html>`
 
 func HandleConsole(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeInvalidRequestError(w, "Only GET method is allowed")
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeInvalidRequestError(w, "Only GET and HEAD methods are allowed")
 		return
 	}
 	if r.URL.Path == "/console/" {
@@ -414,5 +414,8 @@ func HandleConsole(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return
+	}
 	_, _ = w.Write([]byte(consoleHTML))
 }
