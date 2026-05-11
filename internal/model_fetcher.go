@@ -124,39 +124,61 @@ func fetchLatestModels() {
 		LogDebug("Failed to get token for model fetching: %v", err)
 		return
 	}
-	req, err := fhttp.NewRequest("GET", "https://chat.z.ai/api/models", nil)
-	if err != nil {
-		LogDebug("Failed to create model request: %v", err)
-		return
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/json")
-	ApplyBrowserFingerprintHeaders(req.Header)
+
 	client, err := TLSHTTPClient(10 * time.Second)
 	if err != nil {
 		LogDebug("Failed to create tls client: %v", err)
 		return
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		LogDebug("Failed to fetch models: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+
+	for attempt := 0; attempt < 2; attempt++ {
+		req, err := fhttp.NewRequest("GET", "https://chat.z.ai/api/models", nil)
+		if err != nil {
+			LogDebug("Failed to create model request: %v", err)
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Accept", "application/json")
+		ApplyBrowserFingerprintHeaders(req.Header)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			LogDebug("Failed to fetch models: %v", err)
+			return
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			var modelsResp ZAIModelsResponse
+			err = json.NewDecoder(resp.Body).Decode(&modelsResp)
+			resp.Body.Close()
+			if err != nil {
+				LogDebug("Failed to decode models response: %v", err)
+				return
+			}
+
+			updateDynamicMappings(modelsResp.Data)
+			LogInfo("Fetched %d models from API", len(modelsResp.Data))
+			return
+		}
+
+		resp.Body.Close()
+		if (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && attempt == 0 {
+			refreshOutcome := GetTokenManager().RefreshToken(token, true)
+			if refreshOutcome.Valid && refreshOutcome.Refreshed && refreshOutcome.Token != "" && refreshOutcome.Token != token {
+				token = refreshOutcome.Token
+				LogWarn("Model API auth failed, refreshed token and retrying")
+				continue
+			}
+			if altToken := GetTokenManager().GetAlternativeToken(token); altToken != "" {
+				token = altToken
+				LogWarn("Model API auth failed, retrying with alternative token")
+				continue
+			}
+		}
+
 		LogDebug("Model API returned status %d", resp.StatusCode)
 		return
 	}
-	var modelsResp ZAIModelsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&modelsResp); err != nil {
-		LogDebug("Failed to decode models response: %v", err)
-		return
-	}
-
-	// 更新动态映射
-	updateDynamicMappings(modelsResp.Data)
-
-	LogInfo("Fetched %d models from API", len(modelsResp.Data))
 }
 
 // inferModelConfig 根据模型名称自动推断配置

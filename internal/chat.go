@@ -655,6 +655,19 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			resp.Body.Close()
 			LogError("Upstream error (attempt %d): status=%d, body=%s", attempt+1, resp.StatusCode, string(body)[:min(500, len(body))])
 			lastError = fmt.Sprintf("status %d", resp.StatusCode)
+			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				refreshOutcome := GetTokenManager().RefreshToken(token, true)
+				if refreshOutcome.Valid && refreshOutcome.Refreshed && refreshOutcome.Token != "" && refreshOutcome.Token != token {
+					token = refreshOutcome.Token
+					LogWarn("Upstream auth failed, refreshed token and retrying")
+					continue
+				}
+				if altToken := GetTokenManager().GetAlternativeToken(token); altToken != "" {
+					token = altToken
+					LogWarn("Upstream auth failed, retrying with alternative token")
+					continue
+				}
+			}
 			// 非 5xx 错误不重试
 			if resp.StatusCode < 500 {
 				GetTokenManager().RecordCall(false, isMultimodal)
