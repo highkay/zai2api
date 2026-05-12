@@ -33,6 +33,11 @@ main
 
 # Data files (contains sensitive tokens)
 /data/tokens.txt
+/data/tokens_invalid.txt
+/data/*.db
+/data/*.db-*
+/data/*.sqlite
+/data/*.sqlite-*
 
 # Test files
 test.txt
