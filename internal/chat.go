@@ -448,11 +448,17 @@ func classifyNonRetryableUpstreamError(errorCode, errorMessage string) (statusCo
 	switch normalizedCode {
 	case "429", "MODEL_CONCURRENCY_LIMIT", "RATE_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS":
 		return http.StatusTooManyRequests, "rate_limit_exceeded", true
+	case "FRONTEND_CAPTCHA_REQUIRED":
+		return http.StatusForbidden, "frontend_captcha_required", true
 	case RetryableErr:
 		return 0, "", false
 	}
 
 	switch {
+	case strings.Contains(normalizedMessage, "captcha_required"),
+		strings.Contains(normalizedMessage, "captcha required"),
+		strings.Contains(normalizedMessage, "人机验证"):
+		return http.StatusForbidden, "frontend_captcha_required", true
 	case strings.Contains(normalizedMessage, "current concurrent conversation limit"),
 		strings.Contains(normalizedMessage, "currently at capacity"),
 		strings.Contains(normalizedMessage, "too many requests"):

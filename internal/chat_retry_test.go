@@ -108,6 +108,58 @@ func TestHandleChatCompletionsStopsRetryingOnUpstreamConcurrencyLimit(t *testing
 	}
 }
 
+func TestHandleChatCompletionsStopsRetryingOnUpstreamCaptchaRequired(t *testing.T) {
+	initChatRetryTests(t)
+	setupChatRetryTokenManager()
+
+	oldCfg := Cfg
+	oldMakeUpstreamRequest := makeUpstreamRequestFunc
+	Cfg = &Config{
+		AuthTokens: []string{"admin-key"},
+		RetryCount: 5,
+	}
+	t.Cleanup(func() {
+		Cfg = oldCfg
+		makeUpstreamRequestFunc = oldMakeUpstreamRequest
+	})
+
+	attempts := 0
+	makeUpstreamRequestFunc = func(ctx context.Context, token string, messages []Message, model string, stream bool, imageURLs, videoURLs []string, hasTools bool) (*fhttp.Response, string, error) {
+		attempts++
+		sse := "data: {\"type\":\"chat:completion\",\"data\":{\"done\":true,\"error\":{\"captcha_error_type\":\"missing_param\",\"code\":\"FRONTEND_CAPTCHA_REQUIRED\",\"detail\":\"Please refresh the page to update the app, then try again.\",\"error_code\":\"FRONTEND_CAPTCHA_REQUIRED\"}}}\n\n" +
+			"data: [DONE]\n\n"
+		return &fhttp.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewBufferString(sse)),
+		}, "GLM-5.1", nil
+	}
+
+	body := map[string]interface{}{
+		"model": "GLM-5.1",
+		"messages": []map[string]string{
+			{"role": "user", "content": "hello"},
+		},
+		"stream": false,
+	}
+	payload, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer admin-key")
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	HandleChatCompletions(rec, req)
+
+	if attempts != 1 {
+		t.Fatalf("expected exactly one upstream attempt, got %d", attempts)
+	}
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("frontend_captcha_required")) {
+		t.Fatalf("expected frontend_captcha_required code, got %s", rec.Body.String())
+	}
+}
+
 func TestHandleChatCompletionsStopsWhenRequestContextCanceled(t *testing.T) {
 	initChatRetryTests(t)
 	setupChatRetryTokenManager()
