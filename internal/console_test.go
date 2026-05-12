@@ -21,7 +21,7 @@ func TestHandleConsoleServesSelfContainedPage(t *testing.T) {
 		t.Fatalf("expected html content type, got %q", contentType)
 	}
 	body := rec.Body.String()
-	for _, expected := range []string{"zai2api", "/v1/tokens", "total-calls", "failed-calls", "Token management is locked"} {
+	for _, expected := range []string{"zai2api", "/v1/tokens", "total-calls", "failed-calls", "Token ledger is locked"} {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("console page missing %q", expected)
 		}

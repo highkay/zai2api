@@ -8,25 +8,32 @@ import (
 	"io"
 	"net/http"
 	"os"
-
-	fhttp "github.com/bogdanfinn/fhttp"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
+	fhttp "github.com/bogdanfinn/fhttp"
 )
 
-// TokenInfo 存储单个 token 的信息
 type TokenInfo struct {
-	Token         string    `json:"token"`
+	ID            int64     `json:"id,omitempty"`
+	Token         string    `json:"token,omitempty"`
+	TokenHash     string    `json:"token_hash,omitempty"`
+	TokenPreview  string    `json:"token_preview,omitempty"`
+	Source        string    `json:"source,omitempty"`
+	Status        string    `json:"status,omitempty"`
 	Email         string    `json:"email"`
 	UserID        string    `json:"user_id"`
 	Valid         bool      `json:"valid"`
 	LastChecked   time.Time `json:"last_checked"`
 	LastRefreshed time.Time `json:"last_refreshed"`
+	InvalidatedAt time.Time `json:"invalidated_at,omitempty"`
+	InvalidReason string    `json:"invalid_reason,omitempty"`
+	ReplacedByID  int64     `json:"replaced_by_id,omitempty"`
+	CreatedAt     time.Time `json:"created_at,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at,omitempty"`
 	UseCount      int64     `json:"use_count"`
 	source        tokenSource
 }
@@ -34,8 +41,9 @@ type TokenInfo struct {
 type tokenSource string
 
 const (
-	tokenSourceFile   tokenSource = "file"
-	tokenSourceBackup tokenSource = "backup"
+	tokenSourceFile   tokenSource = TokenSourceLegacyFile
+	tokenSourceBackup tokenSource = TokenSourceEnvBackup
+	tokenSourceAPI    tokenSource = TokenSourceAPI
 	tokenRefreshURL               = "https://chat.z.ai/api/v1/auths/"
 )
 
@@ -63,21 +71,24 @@ type TokenRefreshOutcome struct {
 	Refreshed bool
 }
 
-// TokenManager 管理所有用户 token
 type TokenManager struct {
 	mu              sync.RWMutex
-	tokens          map[string]*TokenInfo // token -> TokenInfo
-	validTokens     []string              // 有效 token 列表
-	fileTokens      []string              // tokens.txt 中的 token 顺序
-	backupTokens    []string              // BACKUP_TOKEN 中的 token 顺序
-	currentIndex    int                   // 轮询索引
+	tokens          map[string]*TokenInfo
+	validTokens     []string
+	currentIndex    int
 	dataDir         string
-	watcher         *fsnotify.Watcher
+	dbPath          string
+	store           TokenStore
 	checkInterval   time.Duration
 	stopChan        chan struct{}
-	multimodalCount int64 // 多模态请求计数
-	totalCalls      int64 // 累计调用次数
-	successCalls    int64 // 成功调用次数
+	stopOnce        sync.Once
+	multimodalCount int64
+	totalCalls      int64
+	successCalls    int64
+	totalTokenCount int
+	invalidCount    int
+	disabledCount   int
+	rotatedCount    int
 }
 
 var (
@@ -100,15 +111,13 @@ func NewTokenManager(dataDir string) *TokenManager {
 	return &TokenManager{
 		tokens:        make(map[string]*TokenInfo),
 		validTokens:   make([]string, 0),
-		fileTokens:    make([]string, 0),
-		backupTokens:  make([]string, 0),
 		dataDir:       dataDir,
+		dbPath:        filepath.Join(dataDir, "tokens.db"),
 		checkInterval: 5 * time.Minute,
 		stopChan:      make(chan struct{}),
 	}
 }
 
-// GetTokenManager 获取单例 TokenManager
 func GetTokenManager() *TokenManager {
 	tokenOnce.Do(func() {
 		tokenManager = NewTokenManager("data")
@@ -124,68 +133,6 @@ func normalizeTokenValue(raw string) string {
 	return raw
 }
 
-func cloneTokenInfo(info *TokenInfo) TokenInfo {
-	if info == nil {
-		return TokenInfo{}
-	}
-	return TokenInfo{
-		Token:         info.Token,
-		Email:         info.Email,
-		UserID:        info.UserID,
-		Valid:         info.Valid,
-		LastChecked:   info.LastChecked,
-		LastRefreshed: info.LastRefreshed,
-		UseCount:      info.UseCount,
-	}
-}
-
-func (tm *TokenManager) tokenFilePath() string {
-	return filepath.Join(tm.dataDir, "tokens.txt")
-}
-
-func (tm *TokenManager) invalidTokenFilePath() string {
-	return filepath.Join(tm.dataDir, "tokens_invalid.txt")
-}
-
-func (tm *TokenManager) readTokenEntriesFromFile() ([]string, error) {
-	file, err := os.Open(tm.tokenFilePath())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return []string{}, nil
-		}
-		return nil, err
-	}
-	defer file.Close()
-
-	var tokens []string
-	seen := make(map[string]bool)
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		token := normalizeTokenValue(scanner.Text())
-		if token == "" || seen[token] || strings.HasPrefix(strings.TrimSpace(scanner.Text()), "#") {
-			continue
-		}
-		seen[token] = true
-		tokens = append(tokens, token)
-	}
-	return tokens, scanner.Err()
-}
-
-func (tm *TokenManager) writeTokenEntries(tokens []string) error {
-	if err := os.MkdirAll(tm.dataDir, 0755); err != nil {
-		return err
-	}
-
-	content := "# 用户 Token 文件（自动更新）\n"
-	content += "# 兼容历史格式：读取时支持 token=...、空行和注释行\n"
-	content += fmt.Sprintf("# 更新时间: %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
-	content += strings.Join(tokens, "\n")
-	if len(tokens) > 0 {
-		content += "\n"
-	}
-	return os.WriteFile(tm.tokenFilePath(), []byte(content), 0644)
-}
-
 func normalizeTokenInputs(rawTokens []string) []string {
 	var tokens []string
 	seen := make(map[string]bool)
@@ -198,6 +145,91 @@ func normalizeTokenInputs(rawTokens []string) []string {
 		tokens = append(tokens, token)
 	}
 	return tokens
+}
+
+func cloneTokenInfo(info *TokenInfo) TokenInfo {
+	if info == nil {
+		return TokenInfo{}
+	}
+	return *info
+}
+
+func (tm *TokenManager) tokenFilePath() string {
+	return filepath.Join(tm.dataDir, "tokens.txt")
+}
+
+func (tm *TokenManager) invalidTokenFilePath() string {
+	return filepath.Join(tm.dataDir, "tokens_invalid.txt")
+}
+
+func (tm *TokenManager) tokenDBPath() string {
+	if Cfg != nil && Cfg.TokenDBPath != "" {
+		return Cfg.TokenDBPath
+	}
+	if tm.dbPath != "" {
+		return tm.dbPath
+	}
+	return filepath.Join(tm.dataDir, "tokens.db")
+}
+
+func (tm *TokenManager) ensureStore() error {
+	if tm.store != nil {
+		return nil
+	}
+	store := NewSQLiteTokenStore(tm.tokenDBPath())
+	if err := store.Init(); err != nil {
+		return err
+	}
+	tm.store = store
+	return nil
+}
+
+func (tm *TokenManager) readTokenEntriesFromFile() ([]string, error) {
+	return readTokenEntries(tm.tokenFilePath())
+}
+
+func (tm *TokenManager) readInvalidTokenEntriesFromFile() ([]string, error) {
+	return readTokenEntries(tm.invalidTokenFilePath())
+}
+
+func readTokenEntries(path string) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []string{}, nil
+		}
+		return nil, err
+	}
+	defer file.Close()
+
+	var tokens []string
+	seen := make(map[string]bool)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		raw := strings.TrimSpace(scanner.Text())
+		token := normalizeTokenValue(raw)
+		if token == "" || seen[token] || strings.HasPrefix(raw, "#") {
+			continue
+		}
+		seen[token] = true
+		tokens = append(tokens, token)
+	}
+	return tokens, scanner.Err()
+}
+
+func (tm *TokenManager) writeTokenEntries(tokens []string) error {
+	if err := os.MkdirAll(tm.dataDir, 0700); err != nil {
+		return err
+	}
+
+	content := "# Legacy token file. zai2api now stores tokens in data/tokens.db.\n"
+	content += "# This file is imported only once when the SQLite store is initialized.\n"
+	content += fmt.Sprintf("# Updated: %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
+	content += strings.Join(tokens, "\n")
+	if len(tokens) > 0 {
+		content += "\n"
+	}
+	return os.WriteFile(tm.tokenFilePath(), []byte(content), 0600)
 }
 
 func fetchAuthSession(token string) (authSessionResponse, int, error) {
@@ -250,46 +282,89 @@ func isDefinitiveAuthFailure(statusCode int) bool {
 	return statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden
 }
 
-// Start 启动 token 管理器
 func (tm *TokenManager) Start() error {
-	// 确保 data 目录存在
-	if err := os.MkdirAll(tm.dataDir, 0755); err != nil {
+	if err := os.MkdirAll(tm.dataDir, 0700); err != nil {
 		return fmt.Errorf("创建 data 目录失败: %v", err)
 	}
-
-	// 初始加载 token
 	if err := tm.loadTokens(); err != nil {
 		LogWarn("初始加载 token 失败: %v", err)
 	}
 
-	// 启动文件监听
-	if err := tm.startWatcher(); err != nil {
-		LogWarn("启动文件监听失败: %v", err)
-	}
-
-	// 启动定期验证
 	go tm.startValidator()
 
-	LogInfo("TokenManager 已启动，当前有效 token 数: %d", len(tm.validTokens))
+	LogInfo("TokenManager 已启动，当前有效 token 数: %d", tm.ValidTokenCount())
 	return nil
 }
 
-// Stop 停止 token 管理器
 func (tm *TokenManager) Stop() {
-	close(tm.stopChan)
-	if tm.watcher != nil {
-		tm.watcher.Close()
-	}
+	tm.stopOnce.Do(func() {
+		close(tm.stopChan)
+		if tm.store != nil {
+			_ = tm.store.Close()
+		}
+	})
 }
 
-// loadTokens 从 data 目录加载所有 token
 func (tm *TokenManager) loadTokens() error {
-	tokenFile := tm.tokenFilePath()
-	if _, err := os.Stat(tokenFile); os.IsNotExist(err) {
-		tm.createExampleTokenFile(tokenFile)
+	if err := os.MkdirAll(tm.dataDir, 0700); err != nil {
+		return err
+	}
+	if err := tm.ensureStore(); err != nil {
+		return err
 	}
 
-	fileTokens, err := tm.readTokenEntriesFromFile()
+	legacyActive, err := tm.readTokenEntriesFromFile()
+	if err != nil {
+		return err
+	}
+	legacyInvalid, err := tm.readInvalidTokenEntriesFromFile()
+	if err != nil {
+		return err
+	}
+	importSummary, err := tm.store.ImportLegacyFilesOnce(legacyActive, legacyInvalid)
+	if err != nil {
+		return err
+	}
+	if importSummary.LegacyActive > 0 || importSummary.LegacyInvalid > 0 {
+		LogInfo("已导入 legacy token: active=%d invalid=%d", importSummary.LegacyActive, importSummary.LegacyInvalid)
+	}
+
+	var backupTokens []string
+	if Cfg != nil {
+		backupTokens = normalizeTokenInputs(Cfg.BackupTokens)
+	}
+	backupImported, err := tm.store.SyncBackupTokens(backupTokens)
+	if err != nil {
+		return err
+	}
+	if backupImported > 0 {
+		LogInfo("已导入 BACKUP_TOKEN 到 SQLite 管理副本: %d", backupImported)
+	}
+
+	return tm.reloadFromStore()
+}
+
+func (tm *TokenManager) createExampleTokenFile(path string) {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		LogWarn("创建示例 token 文件目录失败: %v", err)
+		return
+	}
+	content := `# Legacy token file
+# zai2api now uses data/tokens.db as the token source of truth.
+# Existing tokens.txt content is imported only once when the SQLite store is initialized.
+`
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		LogWarn("创建示例 token 文件失败: %v", err)
+		return
+	}
+	LogInfo("已创建 legacy token 文件: %s", path)
+}
+
+func (tm *TokenManager) reloadFromStore() error {
+	if tm.store == nil {
+		return nil
+	}
+	records, err := tm.store.ListTokens(TokenListOptions{Status: "all", IncludeToken: true})
 	if err != nil {
 		return err
 	}
@@ -297,119 +372,38 @@ func (tm *TokenManager) loadTokens() error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	oldTokens := tm.tokens
 	tm.tokens = make(map[string]*TokenInfo)
-	tm.validTokens = make([]string, 0)
-	tm.fileTokens = make([]string, 0)
-	tm.backupTokens = make([]string, 0)
+	tm.validTokens = make([]string, 0, len(records))
+	tm.totalTokenCount = len(records)
+	tm.invalidCount = 0
+	tm.disabledCount = 0
+	tm.rotatedCount = 0
 
-	seen := make(map[string]bool)
-	for _, token := range fileTokens {
-		tm.registerLoadedTokenLocked(token, tokenSourceFile, oldTokens, seen)
+	for _, record := range records {
+		info := record
+		info.Valid = info.Status == TokenStatusActive
+		info.source = tokenSource(info.Source)
+		switch info.Status {
+		case TokenStatusActive:
+			tm.tokens[info.Token] = &info
+			tm.validTokens = append(tm.validTokens, info.Token)
+		case TokenStatusInvalid:
+			tm.invalidCount++
+		case TokenStatusDisabled:
+			tm.disabledCount++
+		case TokenStatusRotated:
+			tm.rotatedCount++
+		}
 	}
-	var backupTokens []string
-	if Cfg != nil {
-		backupTokens = normalizeTokenInputs(Cfg.BackupTokens)
+	if tm.currentIndex >= len(tm.validTokens) && len(tm.validTokens) > 0 {
+		tm.currentIndex = tm.currentIndex % len(tm.validTokens)
 	}
-	for _, token := range backupTokens {
-		tm.registerLoadedTokenLocked(token, tokenSourceBackup, oldTokens, seen)
-	}
-
-	tm.rebuildValidTokensLocked()
-	LogInfo("已加载 %d 个 token", len(tm.validTokens))
+	LogInfo("已加载 SQLite token: active=%d total=%d invalid=%d disabled=%d rotated=%d",
+		len(tm.validTokens), tm.totalTokenCount, tm.invalidCount, tm.disabledCount, tm.rotatedCount)
 	return nil
 }
 
-// createExampleTokenFile 创建示例 token 文件
-func (tm *TokenManager) createExampleTokenFile(path string) {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		LogWarn("创建示例 token 文件目录失败: %v", err)
-		return
-	}
-	content := `# 用户 Token 文件
-# 每行一个 token，支持以下格式：
-# 1. 直接写 token
-# 2. token=xxx 格式
-# 以 # 开头的行为注释
-
-# 示例:
-# eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.xxxxx
-`
-	os.WriteFile(path, []byte(content), 0644)
-	LogInfo("已创建示例 token 文件: %s", path)
-}
-
-func (tm *TokenManager) registerLoadedTokenLocked(token string, source tokenSource, oldTokens map[string]*TokenInfo, seen map[string]bool) {
-	token = normalizeTokenValue(token)
-	if token == "" || seen[token] {
-		return
-	}
-	seen[token] = true
-
-	switch source {
-	case tokenSourceFile:
-		tm.fileTokens = append(tm.fileTokens, token)
-	case tokenSourceBackup:
-		tm.backupTokens = append(tm.backupTokens, token)
-	}
-
-	if oldInfo, exists := oldTokens[token]; exists {
-		oldInfo.source = source
-		tm.tokens[token] = oldInfo
-		return
-	}
-
-	info := &TokenInfo{
-		Token:  token,
-		Valid:  true,
-		source: source,
-	}
-	if payload, err := DecodeJWTPayload(token); err == nil && payload != nil {
-		info.Email = payload.Email
-		info.UserID = payload.ID
-	}
-	tm.tokens[token] = info
-}
-
-// startWatcher 启动文件变化监听
-func (tm *TokenManager) startWatcher() error {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return err
-	}
-	tm.watcher = watcher
-
-	go func() {
-		for {
-			select {
-			case event, ok := <-watcher.Events:
-				if !ok {
-					return
-				}
-				if event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
-					if strings.HasSuffix(event.Name, "tokens.txt") {
-						LogInfo("检测到 token 文件变化，重新加载...")
-						time.Sleep(100 * time.Millisecond) // 等待文件写入完成
-						tm.loadTokens()
-					}
-				}
-			case err, ok := <-watcher.Errors:
-				if !ok {
-					return
-				}
-				LogError("文件监听错误: %v", err)
-			case <-tm.stopChan:
-				return
-			}
-		}
-	}()
-
-	return watcher.Add(tm.dataDir)
-}
-
-// startValidator 启动定期验证
 func (tm *TokenManager) startValidator() {
-	// 首次延迟验证
 	time.Sleep(10 * time.Second)
 	tm.validateAllTokens()
 
@@ -426,7 +420,6 @@ func (tm *TokenManager) startValidator() {
 	}
 }
 
-// validateAllTokens 验证所有 token
 func (tm *TokenManager) validateAllTokens() {
 	tokens := tm.tokensNeedingRefresh()
 	if len(tokens) == 0 {
@@ -441,7 +434,7 @@ func (tm *TokenManager) validateAllTokens() {
 	}
 
 	refreshedCount, invalidCount := tm.applyTokenCheckResults(results)
-	LogInfo("Token 刷新完成，轮换 %d 个，失效 %d 个，剩余有效 %d 个", refreshedCount, invalidCount, len(tm.validTokens))
+	LogInfo("Token 刷新完成，轮换 %d 个，失效 %d 个，剩余有效 %d 个", refreshedCount, invalidCount, tm.ValidTokenCount())
 }
 
 func (tm *TokenManager) tokensNeedingRefresh() []string {
@@ -449,13 +442,8 @@ func (tm *TokenManager) tokensNeedingRefresh() []string {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
 
-	tokens := make([]string, 0, len(tm.fileTokens)+len(tm.backupTokens))
-	for _, token := range tm.fileTokens {
-		if info, exists := tm.tokens[token]; exists && tm.shouldRefreshLocked(info, now) {
-			tokens = append(tokens, token)
-		}
-	}
-	for _, token := range tm.backupTokens {
+	tokens := make([]string, 0, len(tm.validTokens))
+	for _, token := range tm.validTokens {
 		if info, exists := tm.tokens[token]; exists && tm.shouldRefreshLocked(info, now) {
 			tokens = append(tokens, token)
 		}
@@ -505,237 +493,77 @@ func (tm *TokenManager) checkToken(token string) tokenCheckResult {
 	return result
 }
 
-func replaceTokenInSlice(tokens []string, oldToken, newToken string) []string {
-	if oldToken == "" || newToken == "" {
-		return append([]string(nil), tokens...)
-	}
-	result := make([]string, 0, len(tokens))
-	seen := make(map[string]bool, len(tokens))
-	for _, token := range tokens {
-		if token == oldToken {
-			token = newToken
-		}
-		if token == "" || seen[token] {
-			continue
-		}
-		seen[token] = true
-		result = append(result, token)
-	}
-	return result
-}
-
-func (tm *TokenManager) ensureUniqueTokenOrdersLocked() {
-	normalizedFile := make([]string, 0, len(tm.fileTokens))
-	fileSeen := make(map[string]bool, len(tm.fileTokens))
-	for _, token := range tm.fileTokens {
-		if token == "" || fileSeen[token] {
-			continue
-		}
-		fileSeen[token] = true
-		normalizedFile = append(normalizedFile, token)
-	}
-	tm.fileTokens = normalizedFile
-
-	normalizedBackup := make([]string, 0, len(tm.backupTokens))
-	backupSeen := make(map[string]bool, len(tm.backupTokens))
-	for _, token := range tm.backupTokens {
-		if token == "" || fileSeen[token] || backupSeen[token] {
-			continue
-		}
-		backupSeen[token] = true
-		normalizedBackup = append(normalizedBackup, token)
-	}
-	tm.backupTokens = normalizedBackup
-}
-
-func chooseLaterTime(a, b time.Time) time.Time {
-	if b.After(a) {
-		return b
-	}
-	return a
-}
-
-func mergeTokenInfo(dst, src *TokenInfo) {
-	if dst == nil || src == nil {
-		return
-	}
-	if src.Email != "" {
-		dst.Email = src.Email
-	}
-	if src.UserID != "" {
-		dst.UserID = src.UserID
-	}
-	dst.Valid = dst.Valid || src.Valid
-	dst.UseCount += src.UseCount
-	dst.LastChecked = chooseLaterTime(dst.LastChecked, src.LastChecked)
-	dst.LastRefreshed = chooseLaterTime(dst.LastRefreshed, src.LastRefreshed)
-	if src.source == tokenSourceFile {
-		dst.source = tokenSourceFile
-	}
-}
-
-func (tm *TokenManager) replaceTokenLocked(oldToken, newToken string) *TokenInfo {
-	info, exists := tm.tokens[oldToken]
-	if !exists {
-		return nil
-	}
-	if newToken == "" || newToken == oldToken {
-		info.Token = oldToken
-		return info
-	}
-
-	if existing, exists := tm.tokens[newToken]; exists {
-		mergeTokenInfo(existing, info)
-		delete(tm.tokens, oldToken)
-		tm.fileTokens = replaceTokenInSlice(tm.fileTokens, oldToken, newToken)
-		tm.backupTokens = replaceTokenInSlice(tm.backupTokens, oldToken, newToken)
-		tm.ensureUniqueTokenOrdersLocked()
-		return existing
-	}
-
-	delete(tm.tokens, oldToken)
-	info.Token = newToken
-	tm.tokens[newToken] = info
-	tm.fileTokens = replaceTokenInSlice(tm.fileTokens, oldToken, newToken)
-	tm.backupTokens = replaceTokenInSlice(tm.backupTokens, oldToken, newToken)
-	tm.ensureUniqueTokenOrdersLocked()
-	return info
-}
-
-func (tm *TokenManager) rebuildValidTokensLocked() {
-	tm.validTokens = make([]string, 0, len(tm.fileTokens)+len(tm.backupTokens))
-	for _, token := range tm.fileTokens {
-		info, exists := tm.tokens[token]
-		if exists && info.Valid {
-			tm.validTokens = append(tm.validTokens, token)
-		}
-	}
-	for _, token := range tm.backupTokens {
-		info, exists := tm.tokens[token]
-		if exists && info.Valid {
-			tm.validTokens = append(tm.validTokens, token)
-		}
-	}
-}
-
-// rebuildValidTokens 重建有效 token 列表
-func (tm *TokenManager) rebuildValidTokens() {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-	tm.rebuildValidTokensLocked()
-}
-
-// removeInvalidTokens 从文件中移除失效 token
-func (tm *TokenManager) removeInvalidTokens() {
-	tm.mu.Lock()
-	invalidFileTokens := make([]string, 0)
-
-	newFileTokens := make([]string, 0, len(tm.fileTokens))
-	for _, token := range tm.fileTokens {
-		info, exists := tm.tokens[token]
-		if exists && info.Valid {
-			newFileTokens = append(newFileTokens, token)
-			continue
-		}
-		invalidFileTokens = append(invalidFileTokens, token)
-		delete(tm.tokens, token)
-	}
-	tm.fileTokens = newFileTokens
-
-	newBackupTokens := make([]string, 0, len(tm.backupTokens))
-	for _, token := range tm.backupTokens {
-		info, exists := tm.tokens[token]
-		if exists && info.Valid {
-			newBackupTokens = append(newBackupTokens, token)
-			continue
-		}
-		delete(tm.tokens, token)
-	}
-	tm.backupTokens = newBackupTokens
-	tm.rebuildValidTokensLocked()
-	fileSnapshot := append([]string(nil), tm.fileTokens...)
-	tm.mu.Unlock()
-
-	if len(invalidFileTokens) == 0 {
-		if err := tm.writeTokenEntries(fileSnapshot); err != nil {
-			LogError("重写 token 文件失败: %v", err)
-		}
-		return
-	}
-
-	invalidFile := tm.invalidTokenFilePath()
-	f, err := os.OpenFile(invalidFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err == nil {
-		defer f.Close()
-		timestamp := time.Now().Format("2006-01-02 15:04:05")
-		for _, token := range invalidFileTokens {
-			f.WriteString(fmt.Sprintf("# 失效于 %s\n%s\n", timestamp, token))
-		}
-	}
-	if err := tm.writeTokenEntries(fileSnapshot); err != nil {
-		LogError("重写 token 文件失败: %v", err)
-	}
-	LogInfo("已移除 %d 个失效 token 到 %s", len(invalidFileTokens), invalidFile)
-}
-
 func (tm *TokenManager) applyTokenCheckResults(results []tokenCheckResult) (refreshedCount, invalidCount int) {
-	tm.mu.Lock()
+	if tm.store == nil {
+		return 0, 0
+	}
 	for _, result := range results {
-		info, exists := tm.tokens[result.oldToken]
+		info, exists := tm.GetTokenInfo(result.oldToken)
 		if !exists {
 			continue
 		}
-
-		info.LastChecked = result.checkedAt
 
 		if result.definitiveInvalid {
 			if info.Valid {
 				invalidCount++
 			}
-			info.Valid = false
+			reason := fmt.Sprintf("refresh status %d", result.statusCode)
+			if _, err := tm.store.MarkTokenInvalid(result.oldToken, reason, result.checkedAt); err != nil {
+				LogWarn("标记 token 失效失败: %v", err)
+			}
 			continue
 		}
 		if result.transientErr != nil {
 			LogWarn("Token 刷新暂时失败: status=%d err=%v", result.statusCode, result.transientErr)
+			if _, err := tm.store.MarkTokenChecked(result.oldToken, "", "", result.checkedAt, false); err != nil {
+				LogWarn("更新 token 检查时间失败: %v", err)
+			}
 			continue
 		}
 		if !result.valid {
 			continue
 		}
 
-		info.Valid = true
-		info.LastRefreshed = result.checkedAt
-		if result.email != "" {
-			info.Email = result.email
-		}
-		if result.userID != "" {
-			info.UserID = result.userID
-		}
-
 		if result.newToken != "" && result.newToken != result.oldToken {
-			info = tm.replaceTokenLocked(result.oldToken, result.newToken)
+			source := info.Source
+			if source == "" {
+				source = string(info.source)
+			}
+			if _, _, err := tm.store.ReplaceToken(result.oldToken, result.newToken, result.email, result.userID, result.checkedAt, source); err != nil {
+				LogWarn("轮换 token 持久化失败: %v", err)
+				continue
+			}
 			refreshedCount++
+			continue
 		}
-		if info != nil {
-			info.Token = result.newToken
+		if _, err := tm.store.MarkTokenChecked(result.oldToken, result.email, result.userID, result.checkedAt, true); err != nil {
+			LogWarn("更新 token 刷新状态失败: %v", err)
 		}
 	}
-	tm.rebuildValidTokensLocked()
-	tm.mu.Unlock()
-
-	if refreshedCount > 0 || invalidCount > 0 {
-		tm.removeInvalidTokens()
-		return refreshedCount, invalidCount
+	if err := tm.reloadFromStore(); err != nil {
+		LogWarn("重新加载 token store 失败: %v", err)
 	}
 	return refreshedCount, invalidCount
 }
 
 func (tm *TokenManager) ListTokens() []TokenInfo {
+	return tm.ListTokenRecords(TokenListOptions{Status: TokenStatusActive, IncludeToken: true})
+}
+
+func (tm *TokenManager) ListTokenRecords(options TokenListOptions) []TokenInfo {
+	if tm.store != nil {
+		records, err := tm.store.ListTokens(options)
+		if err != nil {
+			LogWarn("列出 token 失败: %v", err)
+			return []TokenInfo{}
+		}
+		return records
+	}
+
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
-
-	result := make([]TokenInfo, 0, len(tm.fileTokens))
-	for _, token := range tm.fileTokens {
+	result := make([]TokenInfo, 0, len(tm.validTokens))
+	for _, token := range tm.validTokens {
 		info, exists := tm.tokens[token]
 		if !exists {
 			continue
@@ -751,6 +579,15 @@ func (tm *TokenManager) GetTokenInfo(token string) (TokenInfo, bool) {
 		return TokenInfo{}, false
 	}
 
+	if tm.store != nil {
+		info, exists, err := tm.store.GetToken(token)
+		if err != nil {
+			LogWarn("查询 token 失败: %v", err)
+			return TokenInfo{}, false
+		}
+		return info, exists
+	}
+
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
 
@@ -761,150 +598,107 @@ func (tm *TokenManager) GetTokenInfo(token string) (TokenInfo, bool) {
 	return cloneTokenInfo(info), true
 }
 
+func (tm *TokenManager) GetTokenInfoByID(id int64) (TokenInfo, bool) {
+	if id <= 0 {
+		return TokenInfo{}, false
+	}
+	if tm.store != nil {
+		info, exists, err := tm.store.GetTokenByID(id)
+		if err != nil {
+			LogWarn("按 ID 查询 token 失败: %v", err)
+			return TokenInfo{}, false
+		}
+		return info, exists
+	}
+	return TokenInfo{}, false
+}
+
 func (tm *TokenManager) AddTokens(rawTokens []string) ([]TokenInfo, []string, error) {
-	requestedTokens := normalizeTokenInputs(rawTokens)
-	if len(requestedTokens) == 0 {
-		return nil, nil, fmt.Errorf("token is required")
-	}
-
-	tm.mu.Lock()
-	fileTokens, err := tm.readTokenEntriesFromFile()
-	if err != nil {
-		tm.mu.Unlock()
+	if err := tm.ensureStore(); err != nil {
 		return nil, nil, err
 	}
-
-	existing := make(map[string]bool, len(fileTokens))
-	for _, token := range fileTokens {
-		existing[token] = true
-	}
-
-	var addedTokens []string
-	var skippedTokens []string
-	for _, token := range requestedTokens {
-		if existing[token] {
-			skippedTokens = append(skippedTokens, token)
-			continue
-		}
-		existing[token] = true
-		fileTokens = append(fileTokens, token)
-		addedTokens = append(addedTokens, token)
-	}
-
-	if len(addedTokens) > 0 {
-		err = tm.writeTokenEntries(fileTokens)
-	}
-	tm.mu.Unlock()
+	added, skipped, err := tm.store.CreateTokens(rawTokens, TokenSourceAPI)
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(addedTokens) == 0 {
-		return []TokenInfo{}, skippedTokens, nil
-	}
-	if err := tm.loadTokens(); err != nil {
+	if err := tm.reloadFromStore(); err != nil {
 		return nil, nil, err
 	}
-
-	result := make([]TokenInfo, 0, len(addedTokens))
-	for _, token := range addedTokens {
-		if info, exists := tm.GetTokenInfo(token); exists {
-			result = append(result, info)
-		}
-	}
-	return result, skippedTokens, nil
+	return added, skipped, nil
 }
 
 func (tm *TokenManager) UpdateToken(oldToken, newToken string) (TokenInfo, error) {
-	oldToken = normalizeTokenValue(oldToken)
-	newToken = normalizeTokenValue(newToken)
-	if oldToken == "" || newToken == "" {
-		return TokenInfo{}, fmt.Errorf("old_token and new_token are required")
+	if err := tm.ensureStore(); err != nil {
+		return TokenInfo{}, err
 	}
-
-	tm.mu.Lock()
-	fileTokens, err := tm.readTokenEntriesFromFile()
+	info, _, err := tm.store.ReplaceToken(oldToken, newToken, "", "", time.Now(), TokenSourceAPI)
 	if err != nil {
-		tm.mu.Unlock()
 		return TokenInfo{}, err
 	}
-
-	index := -1
-	for i, token := range fileTokens {
-		if token == oldToken {
-			index = i
-			break
-		}
-	}
-	if index == -1 {
-		tm.mu.Unlock()
-		return TokenInfo{}, ErrTokenNotFound
-	}
-	if oldToken != newToken {
-		for _, token := range fileTokens {
-			if token == newToken {
-				tm.mu.Unlock()
-				return TokenInfo{}, ErrTokenAlreadyExists
-			}
-		}
-		fileTokens[index] = newToken
-		if err := tm.writeTokenEntries(fileTokens); err != nil {
-			tm.mu.Unlock()
-			return TokenInfo{}, err
-		}
-	}
-	tm.mu.Unlock()
-
-	if err := tm.loadTokens(); err != nil {
+	if err := tm.reloadFromStore(); err != nil {
 		return TokenInfo{}, err
-	}
-	info, exists := tm.GetTokenInfo(newToken)
-	if !exists {
-		return TokenInfo{}, ErrTokenNotFound
 	}
 	return info, nil
 }
 
 func (tm *TokenManager) DeleteToken(token string) (TokenInfo, error) {
-	token = normalizeTokenValue(token)
-	if token == "" {
-		return TokenInfo{}, fmt.Errorf("token is required")
-	}
+	return tm.DeleteTokenWithMode(token, false)
+}
 
-	deletedInfo, exists := tm.GetTokenInfo(token)
-	if !exists {
-		deletedInfo = TokenInfo{Token: token}
+func (tm *TokenManager) DeleteTokenWithMode(token string, hard bool) (TokenInfo, error) {
+	if err := tm.ensureStore(); err != nil {
+		return TokenInfo{}, err
 	}
-
-	tm.mu.Lock()
-	fileTokens, err := tm.readTokenEntriesFromFile()
+	info, err := tm.store.DeleteToken(token, hard)
 	if err != nil {
-		tm.mu.Unlock()
 		return TokenInfo{}, err
 	}
-
-	index := -1
-	for i, item := range fileTokens {
-		if item == token {
-			index = i
-			break
-		}
-	}
-	if index == -1 {
-		tm.mu.Unlock()
-		return TokenInfo{}, ErrTokenNotFound
-	}
-
-	fileTokens = append(fileTokens[:index], fileTokens[index+1:]...)
-	if err := tm.writeTokenEntries(fileTokens); err != nil {
-		tm.mu.Unlock()
+	if err := tm.reloadFromStore(); err != nil {
 		return TokenInfo{}, err
 	}
-	tm.mu.Unlock()
+	return info, nil
+}
 
-	if err := tm.loadTokens(); err != nil {
+func (tm *TokenManager) DeleteTokenByID(id int64, hard bool) (TokenInfo, error) {
+	if err := tm.ensureStore(); err != nil {
 		return TokenInfo{}, err
 	}
-	return deletedInfo, nil
+	info, err := tm.store.DeleteTokenByID(id, hard)
+	if err != nil {
+		return TokenInfo{}, err
+	}
+	if err := tm.reloadFromStore(); err != nil {
+		return TokenInfo{}, err
+	}
+	return info, nil
+}
+
+func (tm *TokenManager) SetTokenStatus(token, status, reason string) (TokenInfo, error) {
+	if err := tm.ensureStore(); err != nil {
+		return TokenInfo{}, err
+	}
+	info, err := tm.store.SetTokenStatus(token, status, reason)
+	if err != nil {
+		return TokenInfo{}, err
+	}
+	if err := tm.reloadFromStore(); err != nil {
+		return TokenInfo{}, err
+	}
+	return info, nil
+}
+
+func (tm *TokenManager) SetTokenStatusByID(id int64, status, reason string) (TokenInfo, error) {
+	if err := tm.ensureStore(); err != nil {
+		return TokenInfo{}, err
+	}
+	info, err := tm.store.SetTokenStatusByID(id, status, reason)
+	if err != nil {
+		return TokenInfo{}, err
+	}
+	if err := tm.reloadFromStore(); err != nil {
+		return TokenInfo{}, err
+	}
+	return info, nil
 }
 
 func GetUpstreamToken() string {
@@ -934,7 +728,6 @@ func GetUpstreamTokenForModelAPI() (string, error) {
 	return token, nil
 }
 
-// HasValidUpstreamTokens 是否存在可用的 z.ai 上游 token（TokenManager 轮询用）
 func (tm *TokenManager) HasValidUpstreamTokens() bool {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
@@ -947,45 +740,57 @@ func (tm *TokenManager) ValidTokenCount() int {
 	return len(tm.validTokens)
 }
 
-// GetToken 获取一个有效 token（轮询）
 func (tm *TokenManager) GetToken() string {
 	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
 	if len(tm.validTokens) == 0 {
+		tm.mu.Unlock()
 		return ""
 	}
 
 	token := tm.validTokens[tm.currentIndex%len(tm.validTokens)]
 	tm.currentIndex++
-
-	// 增加使用计数
 	if info, exists := tm.tokens[token]; exists {
 		info.UseCount++
 	}
+	store := tm.store
+	tm.mu.Unlock()
 
+	if store != nil {
+		if err := store.IncrementUse(token); err != nil {
+			LogWarn("更新 token 使用计数失败: %v", err)
+		}
+	}
 	return token
 }
 
 func (tm *TokenManager) GetAlternativeToken(exclude string) string {
 	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
 	if len(tm.validTokens) == 0 {
+		tm.mu.Unlock()
 		return ""
 	}
+	var token string
 	for i := 0; i < len(tm.validTokens); i++ {
-		token := tm.validTokens[(tm.currentIndex+i)%len(tm.validTokens)]
-		if token == "" || token == exclude {
+		candidate := tm.validTokens[(tm.currentIndex+i)%len(tm.validTokens)]
+		if candidate == "" || candidate == exclude {
 			continue
 		}
+		token = candidate
 		tm.currentIndex = (tm.currentIndex + i + 1) % len(tm.validTokens)
 		if info, exists := tm.tokens[token]; exists {
 			info.UseCount++
 		}
-		return token
+		break
 	}
-	return ""
+	store := tm.store
+	tm.mu.Unlock()
+
+	if token != "" && store != nil {
+		if err := store.IncrementUse(token); err != nil {
+			LogWarn("更新备用 token 使用计数失败: %v", err)
+		}
+	}
+	return token
 }
 
 func (tm *TokenManager) RefreshToken(token string, force bool) TokenRefreshOutcome {
@@ -1018,12 +823,10 @@ func (tm *TokenManager) RefreshToken(token string, force bool) TokenRefreshOutco
 	if currentToken == "" {
 		currentToken = token
 	}
-	tm.mu.RLock()
-	info, exists := tm.tokens[currentToken]
+	info, exists := tm.GetTokenInfo(currentToken)
 	if !exists && currentToken != token {
-		info, exists = tm.tokens[token]
+		info, exists = tm.GetTokenInfo(token)
 	}
-	tm.mu.RUnlock()
 	if !exists {
 		return TokenRefreshOutcome{Token: currentToken, Valid: invalidCount == 0}
 	}
@@ -1034,7 +837,6 @@ func (tm *TokenManager) RefreshToken(token string, force bool) TokenRefreshOutco
 	}
 }
 
-// RecordCall 记录调用
 func (tm *TokenManager) RecordCall(success bool, isMultimodal bool) {
 	atomic.AddInt64(&tm.totalCalls, 1)
 	if success {
@@ -1045,10 +847,17 @@ func (tm *TokenManager) RecordCall(success bool, isMultimodal bool) {
 	}
 }
 
-// GetStats 获取统计数据
 func (tm *TokenManager) GetStats() TokenManagerStats {
 	tm.mu.RLock()
-	defer tm.mu.RUnlock()
+	validCount := len(tm.validTokens)
+	totalTokenCount := tm.totalTokenCount
+	invalidCount := tm.invalidCount
+	disabledCount := tm.disabledCount
+	rotatedCount := tm.rotatedCount
+	if totalTokenCount == 0 && len(tm.tokens) > 0 {
+		totalTokenCount = len(tm.tokens)
+	}
+	tm.mu.RUnlock()
 
 	total := atomic.LoadInt64(&tm.totalCalls)
 	success := atomic.LoadInt64(&tm.successCalls)
@@ -1064,33 +873,35 @@ func (tm *TokenManager) GetStats() TokenManagerStats {
 	}
 
 	return TokenManagerStats{
-		ValidTokenCount: len(tm.validTokens),
-		TotalTokenCount: len(tm.tokens),
-		MultimodalCount: multimodal,
-		TotalCalls:      total,
-		SuccessCalls:    success,
-		FailedCalls:     failed,
-		SuccessRate:     successRate,
+		ValidTokenCount:    validCount,
+		TotalTokenCount:    totalTokenCount,
+		InvalidTokenCount:  invalidCount,
+		DisabledTokenCount: disabledCount,
+		RotatedTokenCount:  rotatedCount,
+		MultimodalCount:    multimodal,
+		TotalCalls:         total,
+		SuccessCalls:       success,
+		FailedCalls:        failed,
+		SuccessRate:        successRate,
 	}
 }
 
-// TokenManagerStats token 管理器统计数据
 type TokenManagerStats struct {
-	ValidTokenCount int     `json:"valid_token_count"`
-	TotalTokenCount int     `json:"total_token_count"`
-	MultimodalCount int64   `json:"multimodal_count"`
-	TotalCalls      int64   `json:"total_calls"`
-	SuccessCalls    int64   `json:"success_calls"`
-	FailedCalls     int64   `json:"failed_calls"`
-	SuccessRate     float64 `json:"success_rate"`
+	ValidTokenCount    int     `json:"valid_token_count"`
+	TotalTokenCount    int     `json:"total_token_count"`
+	InvalidTokenCount  int     `json:"invalid_token_count"`
+	DisabledTokenCount int     `json:"disabled_token_count"`
+	RotatedTokenCount  int     `json:"rotated_token_count"`
+	MultimodalCount    int64   `json:"multimodal_count"`
+	TotalCalls         int64   `json:"total_calls"`
+	SuccessCalls       int64   `json:"success_calls"`
+	FailedCalls        int64   `json:"failed_calls"`
+	SuccessRate        float64 `json:"success_rate"`
 }
 
-// GetClientIP 从请求中获取客户端 IP
 func GetClientIP(r *http.Request) string {
-	// 优先从 X-Forwarded-For 获取
 	xff := r.Header.Get("X-Forwarded-For")
 	if xff != "" {
-		// X-Forwarded-For 可能包含多个 IP，取第一个
 		ips := strings.Split(xff, ",")
 		if len(ips) > 0 {
 			ip := strings.TrimSpace(ips[0])
@@ -1100,15 +911,12 @@ func GetClientIP(r *http.Request) string {
 		}
 	}
 
-	// 尝试 X-Real-IP
 	xri := r.Header.Get("X-Real-IP")
 	if xri != "" {
 		return xri
 	}
 
-	// 最后使用 RemoteAddr
 	ip := r.RemoteAddr
-	// 去除端口
 	if idx := strings.LastIndex(ip, ":"); idx != -1 {
 		ip = ip[:idx]
 	}

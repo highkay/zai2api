@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -29,6 +30,7 @@ func TestTokenManagerKeepsTokensTxtCompatibility(t *testing.T) {
 	}
 
 	tm := NewTokenManager(tempDir)
+	t.Cleanup(tm.Stop)
 	if err := tm.loadTokens(); err != nil {
 		t.Fatalf("load tokens: %v", err)
 	}
@@ -65,18 +67,50 @@ func TestTokenManagerKeepsTokensTxtCompatibility(t *testing.T) {
 		t.Fatalf("unexpected deleted token: %+v", deleted)
 	}
 
-	finalTokens, err := tm.readTokenEntriesFromFile()
-	if err != nil {
-		t.Fatalf("read final tokens: %v", err)
-	}
-	expected := []string{"delta.one.two", "gamma.one.two"}
+	finalTokens := tm.ListTokenRecords(TokenListOptions{Status: TokenStatusActive, IncludeToken: true})
+	expected := []string{"gamma.one.two", "delta.one.two"}
 	if len(finalTokens) != len(expected) {
 		t.Fatalf("unexpected final token count: %+v", finalTokens)
 	}
 	for i, token := range expected {
-		if finalTokens[i] != token {
+		if finalTokens[i].Token != token {
 			t.Fatalf("unexpected token order: %+v", finalTokens)
 		}
+	}
+
+	allTokens := tm.ListTokenRecords(TokenListOptions{Status: "all", IncludeToken: true})
+	if len(allTokens) != 4 {
+		t.Fatalf("expected active plus rotated/disabled records, got %+v", allTokens)
+	}
+}
+
+func TestTokenManagerImportsInvalidLegacyTokens(t *testing.T) {
+	initTokenTests(t)
+
+	tempDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tempDir, "tokens.txt"), []byte("active.one.two\n"), 0600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, "tokens_invalid.txt"), []byte("# old invalid\ninvalid.one.two\n"), 0600); err != nil {
+		t.Fatalf("write invalid token file: %v", err)
+	}
+
+	tm := NewTokenManager(tempDir)
+	t.Cleanup(tm.Stop)
+	if err := tm.loadTokens(); err != nil {
+		t.Fatalf("load tokens: %v", err)
+	}
+
+	allTokens := tm.ListTokenRecords(TokenListOptions{Status: "all", IncludeToken: true})
+	if len(allTokens) != 2 {
+		t.Fatalf("expected active and invalid token records, got %+v", allTokens)
+	}
+	invalid := tm.ListTokenRecords(TokenListOptions{Status: TokenStatusInvalid, IncludeToken: true})
+	if len(invalid) != 1 || invalid[0].Token != "invalid.one.two" || invalid[0].Valid {
+		t.Fatalf("invalid legacy token not visible: %+v", invalid)
+	}
+	if tm.ValidTokenCount() != 1 {
+		t.Fatalf("invalid token should not enter upstream pool")
 	}
 }
 
@@ -85,6 +119,7 @@ func TestHandleTokensCRUD(t *testing.T) {
 
 	tempDir := t.TempDir()
 	tm := NewTokenManager(tempDir)
+	t.Cleanup(tm.Stop)
 	if err := tm.writeTokenEntries(nil); err != nil {
 		t.Fatalf("write empty token file: %v", err)
 	}
@@ -133,6 +168,17 @@ func TestHandleTokensCRUD(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "one.two.three") {
 		t.Fatalf("unexpected list response: %d %s", rec.Code, rec.Body.String())
 	}
+	if strings.Contains(rec.Body.String(), `"token":"one.two.three"`) {
+		t.Fatalf("list response should not reveal raw token by default: %s", rec.Body.String())
+	}
+
+	var list tokenListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(list.Data) != 1 || list.Data[0].ID == 0 {
+		t.Fatalf("unexpected list response: %d %s", rec.Code, rec.Body.String())
+	}
 
 	rec = call(http.MethodPut, "/v1/tokens", map[string]interface{}{
 		"old_token": "one.two.three",
@@ -147,12 +193,69 @@ func TestHandleTokensCRUD(t *testing.T) {
 		t.Fatalf("unexpected delete response: %d %s", rec.Code, rec.Body.String())
 	}
 
-	finalTokens, err := tm.readTokenEntriesFromFile()
-	if err != nil {
-		t.Fatalf("read final tokens: %v", err)
-	}
+	finalTokens := tm.ListTokenRecords(TokenListOptions{Status: TokenStatusActive, IncludeToken: true})
 	if len(finalTokens) != 0 {
 		t.Fatalf("expected empty tokens, got %+v", finalTokens)
+	}
+}
+
+func TestHandleTokensHardDeleteByID(t *testing.T) {
+	initTokenTests(t)
+
+	tempDir := t.TempDir()
+	tm := NewTokenManager(tempDir)
+	t.Cleanup(tm.Stop)
+	if err := tm.loadTokens(); err != nil {
+		t.Fatalf("load tokens: %v", err)
+	}
+
+	oldCfg := Cfg
+	Cfg = &Config{AuthTokens: []string{"admin-key"}}
+	t.Cleanup(func() {
+		Cfg = oldCfg
+	})
+
+	tokenManager = tm
+	tokenOnce = sync.Once{}
+	tokenOnce.Do(func() {})
+
+	call := func(method, target string, body interface{}) *httptest.ResponseRecorder {
+		var payload []byte
+		if body != nil {
+			payload, _ = json.Marshal(body)
+		}
+		req := httptest.NewRequest(method, target, bytes.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer admin-key")
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		rec := httptest.NewRecorder()
+		HandleTokens(rec, req)
+		return rec
+	}
+
+	rec := call(http.MethodPost, "/v1/tokens", map[string]interface{}{"token": "hard.delete.token"})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected created, got %d: %s", rec.Code, rec.Body.String())
+	}
+	rec = call(http.MethodGet, "/v1/tokens?status=all", nil)
+	var list tokenListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(list.Data) != 1 || list.Data[0].ID == 0 {
+		t.Fatalf("unexpected list response: %s", rec.Body.String())
+	}
+	rec = call(http.MethodDelete, "/v1/tokens?id="+strconv.FormatInt(list.Data[0].ID, 10)+"&hard=true", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("hard delete failed: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = call(http.MethodGet, "/v1/tokens?status=all", nil)
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode final list: %v", err)
+	}
+	if list.Count != 0 {
+		t.Fatalf("expected hard-deleted ledger to be empty, got %s", rec.Body.String())
 	}
 }
 
@@ -161,6 +264,7 @@ func TestHandleChatCompletionsWithoutUpstreamToken(t *testing.T) {
 
 	tempDir := t.TempDir()
 	tm := NewTokenManager(tempDir)
+	t.Cleanup(tm.Stop)
 	if err := tm.writeTokenEntries(nil); err != nil {
 		t.Fatalf("write empty token file: %v", err)
 	}

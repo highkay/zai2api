@@ -19,8 +19,8 @@
 - 支持模型映射、思考模式、搜索模式和动态模型同步
 - 支持工具调用适配：把 OpenAI tools 注入为提示协议，再将模型输出提取回 OpenAI `tool_calls`
 - 支持图片/视频输入：先上传到 z.ai 文件接口，再把文件 ID 回填到上游消息
-- 支持基于 `data/tokens.txt` 的 token 管理 API，并通过 `/api/v1/auths/` 滚动刷新 z.ai bearer
-- 提供精简 `/console` 控制台，展示调用统计、成功/失败数量、模型统计和文件 token 管理
+- 支持基于 SQLite token ledger 的 token 管理 API，并通过 `/api/v1/auths/` 滚动刷新 z.ai bearer
+- 提供精简 `/console` 控制台，展示调用统计、成功/失败数量、模型统计和 token ledger 管理
 - 维护遥测、日志、请求重试和基础服务状态输出
 
 ## 技术栈
@@ -31,7 +31,7 @@
   - `github.com/bogdanfinn/tls-client`
   - `github.com/bogdanfinn/fhttp`
 - 配置加载：`github.com/joho/godotenv`
-- 文件监听：`github.com/fsnotify/fsnotify`
+- SQLite token ledger：`modernc.org/sqlite`
 - ID 生成：`github.com/google/uuid`
 - CI：GitHub Actions，按 `linux/windows/darwin` 和 `amd64/arm64` 交叉构建
 
@@ -50,7 +50,7 @@
   - 流式/非流式响应适配
   - `/v1/models` 的处理函数 `HandleModels`
 - `internal/token_api.go`
-  - `tokens.txt` 的增删改查 API
+  - SQLite token ledger 的增删改查 API
 - `internal/models.go`
   - OpenAI 请求结构和响应结构定义
   - 消息内容解析
@@ -73,6 +73,8 @@
   - `.env` 配置加载
 - `internal/token_manager.go`
   - 上游 token 加载、校验、轮询和统计
+- `internal/token_store.go`
+  - SQLite token ledger、legacy 文件导入和状态持久化
 - `internal/telemetry.go`
   - 请求量和 token 用量统计
 
@@ -100,8 +102,8 @@
 2. 从 `Authorization: Bearer ...` 读取客户端 API Key
 3. 按 `AUTH_TOKEN` / `SKIP_AUTH_TOKEN` 规则做 OpenAI 风格鉴权
 4. 取一个当前可用的上游 z.ai token
-   - 优先 `data/tokens.txt`
-   - 其次 `BACKUP_TOKEN`
+   - 优先 SQLite token ledger 中的 `active` token
+   - 其次启动时由 `BACKUP_TOKEN` 导入的 `env_backup` 管理副本
    - 如果两者都没有，直接返回 `503 upstream_token_unavailable`
 5. 解析请求体为 `ChatRequest`
 6. 补默认模型 `GLM-5.1`
@@ -216,19 +218,21 @@
 `GET /console` 返回内置单页控制台，不需要额外前端构建。它只复用现有后端状态源：
 
 - `/`：服务状态、总调用数、成功/失败调用数、成功率、RPM、token 用量、模型维度统计
-- `/v1/tokens`：文件 token 的列表、批量新增和删除
+- `/v1/tokens?status=all`：SQLite token ledger 的列表、批量新增、状态变更和删除
 
-控制台页面本身公开可访问，但 token 管理请求仍走 `AUTH_TOKEN` / `SKIP_AUTH_TOKEN` 规则。页面中的 `AUTH_TOKEN` 只保存在当前浏览器 `localStorage`，后端不新增控制台会话、数据库或 cookie。
+控制台页面本身公开可访问，但 token 管理请求仍走 `AUTH_TOKEN` / `SKIP_AUTH_TOKEN` 规则。页面中的 `AUTH_TOKEN` 默认保存在当前浏览器 `sessionStorage`，只有用户勾选 remember this browser 才写入 `localStorage`。
 
 ## 上游 Token 刷新
 
 Z.ai bearer 被当作可滚动续签的会话凭证处理：
 
-1. `TokenManager` 加载 `data/tokens.txt` 和 `BACKUP_TOKEN` 到同一个内存池。
-2. 定时或鉴权失败时调用 `GET https://chat.z.ai/api/v1/auths/`。
-3. 如果返回新 token，就替换内存中的旧 token；文件来源 token 还会持久化回 `data/tokens.txt`。
-4. 临时网络失败只记录检查时间和日志，不删除 token。
-5. 只有明确的 `401/403` 会把 token 标为失效并从文件池移出。
+1. `TokenManager` 从 SQLite token ledger 加载 `active` token 到内存轮询池。
+2. 首次初始化时会从历史 `data/tokens.txt` 导入 active token，从 `data/tokens_invalid.txt` 导入 invalid token；导入只执行一次。
+3. `BACKUP_TOKEN` 会导入为 `env_backup` 来源的管理副本，后续刷新结果写入 SQLite。
+4. 定时或鉴权失败时调用 `GET https://chat.z.ai/api/v1/auths/`。
+5. 如果返回新 token，就写入新的 active 记录，并把旧 token 标为 `rotated`。
+6. 临时网络失败只记录检查时间和日志，不删除 token。
+7. 只有明确的 `401/403` 会把 token 标为 `invalid` 并移出内存轮询池。
 
 ## 工具调用实现方式
 
@@ -276,6 +280,8 @@ Z.ai bearer 被当作可滚动续签的会话凭证处理：
 - `API_ENDPOINT`
 - `AUTH_TOKEN`
 - `BACKUP_TOKEN`
+- `TOKEN_DB_PATH`
+- `TOKEN_API_ALLOW_REVEAL`
 - `DEBUG_LOGGING`
 - `TOOL_SUPPORT`
 - `RETRY_COUNT`

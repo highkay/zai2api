@@ -35,6 +35,7 @@ func TestTokenManagerRefreshRotatesAndPersistsFileToken(t *testing.T) {
 	}
 
 	tm := NewTokenManager(tempDir)
+	t.Cleanup(tm.Stop)
 	if err := tm.loadTokens(); err != nil {
 		t.Fatalf("load tokens: %v", err)
 	}
@@ -44,8 +45,9 @@ func TestTokenManagerRefreshRotatesAndPersistsFileToken(t *testing.T) {
 		t.Fatalf("unexpected refresh outcome: %+v", outcome)
 	}
 
-	if _, exists := tm.GetTokenInfo("old.one.two"); exists {
-		t.Fatalf("old token should have been replaced")
+	oldInfo, exists := tm.GetTokenInfo("old.one.two")
+	if !exists || oldInfo.Status != TokenStatusRotated {
+		t.Fatalf("old token should be retained as rotated record: %+v exists=%v", oldInfo, exists)
 	}
 	info, exists := tm.GetTokenInfo("new.one.two")
 	if !exists {
@@ -58,11 +60,8 @@ func TestTokenManagerRefreshRotatesAndPersistsFileToken(t *testing.T) {
 		t.Fatalf("expected LastRefreshed to be set")
 	}
 
-	tokens, err := tm.readTokenEntriesFromFile()
-	if err != nil {
-		t.Fatalf("read token file: %v", err)
-	}
-	if len(tokens) != 1 || tokens[0] != "new.one.two" {
+	tokens := tm.ListTokenRecords(TokenListOptions{Status: TokenStatusActive, IncludeToken: true})
+	if len(tokens) != 1 || tokens[0].Token != "new.one.two" {
 		t.Fatalf("unexpected persisted tokens: %+v", tokens)
 	}
 }
@@ -91,6 +90,7 @@ func TestTokenManagerRefreshKeepsTokenOnTransientFailure(t *testing.T) {
 	}
 
 	tm := NewTokenManager(tempDir)
+	t.Cleanup(tm.Stop)
 	if err := tm.loadTokens(); err != nil {
 		t.Fatalf("load tokens: %v", err)
 	}
@@ -108,11 +108,8 @@ func TestTokenManagerRefreshKeepsTokenOnTransientFailure(t *testing.T) {
 		t.Fatalf("expected LastChecked to be updated")
 	}
 
-	tokens, err := tm.readTokenEntriesFromFile()
-	if err != nil {
-		t.Fatalf("read token file: %v", err)
-	}
-	if len(tokens) != 1 || tokens[0] != "alpha.one.two" {
+	tokens := tm.ListTokenRecords(TokenListOptions{Status: TokenStatusActive, IncludeToken: true})
+	if len(tokens) != 1 || tokens[0].Token != "alpha.one.two" {
 		t.Fatalf("unexpected persisted tokens after transient failure: %+v", tokens)
 	}
 }
@@ -127,6 +124,7 @@ func TestTokenManagerLoadsBackupTokensIntoPool(t *testing.T) {
 	})
 
 	tm := NewTokenManager(t.TempDir())
+	t.Cleanup(tm.Stop)
 	if err := tm.loadTokens(); err != nil {
 		t.Fatalf("load tokens: %v", err)
 	}

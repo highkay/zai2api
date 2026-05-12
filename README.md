@@ -14,7 +14,7 @@
 - **工具调用** - 支持 Function Calling
 - **多模态** - 支持图片输入
 - **思考模式** - 支持 Thinking 模型的思考过程处理
-- **Token 管理** - 自动刷新并轮换上游 Token，提供兼容 `data/tokens.txt` 的 CRUD API
+- **Token 管理** - 使用 SQLite token ledger 自动刷新、轮换、隔离和审计上游 Token
 - **遥测统计** - 请求计数、Token 统计、成功/失败数量、成功率等
 
 ## 快速开始
@@ -57,10 +57,11 @@ AUTH_TOKEN=your-api-key
 
 再准备至少一种上游 z.ai token 来源：
 
-1. 推荐：把 token 写入 `data/tokens.txt`
-2. 或者：在 `.env` 中设置 `BACKUP_TOKEN`
+1. 推荐：通过 `/console` 或 `/v1/tokens` 写入 SQLite token ledger，默认路径是 `data/tokens.db`
+2. 兼容导入：首次启动时会从历史 `data/tokens.txt` 导入 active token，从 `data/tokens_invalid.txt` 导入 invalid token
+3. 或者：在 `.env` 中设置 `BACKUP_TOKEN`，启动时会导入为 `env_backup` 来源的管理副本
 
-当前版本不再提供匿名 token 或自动注册 fallback。如果 `data/tokens.txt` 和 `BACKUP_TOKEN` 都为空，`/v1/chat/completions` 会返回 `503 upstream_token_unavailable`。
+当前版本不再提供匿名 token 或自动注册 fallback。如果 SQLite token ledger 和 `BACKUP_TOKEN` 都为空，`/v1/chat/completions` 会返回 `503 upstream_token_unavailable`。
 
 ### 运行
 
@@ -79,7 +80,7 @@ AUTH_TOKEN=your-api-key
 | `/` | GET | 服务状态和遥测数据 |
 | `/console` | GET | 精简控制台，查看调用统计并管理上游 token |
 | `/v1/models` | GET | 获取可用模型列表 |
-| `/v1/tokens` | `GET` / `POST` / `PUT` / `DELETE` | 管理 `data/tokens.txt` 中的上游 token |
+| `/v1/tokens` | `GET` / `POST` / `PUT` / `DELETE` | 管理 SQLite token ledger 中的上游 token |
 | `/v1/chat/completions` | POST | 聊天补全接口 |
 
 ## 配置项
@@ -89,6 +90,8 @@ AUTH_TOKEN=your-api-key
 | `PORT` | 8000 | 服务端口 |
 | `AUTH_TOKEN` | - | API 认证令牌（支持多个，逗号分隔） |
 | `BACKUP_TOKEN` | - | 备用上游令牌（支持多个，逗号分隔） |
+| `TOKEN_DB_PATH` | `data/tokens.db` | SQLite token ledger 路径 |
+| `TOKEN_API_ALLOW_REVEAL` | false | 是否允许 `GET /v1/tokens?reveal=true` 返回完整 bearer |
 | `DEBUG_LOGGING` | false | 调试日志 |
 | `TOOL_SUPPORT` | true | 工具调用支持 |
 | `RETRY_COUNT` | 5 | 请求失败时的重试次数（不含首次请求） |
@@ -113,10 +116,10 @@ curl http://localhost:8000/v1/chat/completions \
 
 ### Token 管理 API
 
-列出当前 `data/tokens.txt` 中的 token：
+列出当前 token ledger 中的 token。默认返回所有状态，但不会返回完整 bearer：
 
 ```bash
-curl http://localhost:8000/v1/tokens \
+curl "http://localhost:8000/v1/tokens?status=all" \
   -H "Authorization: Bearer your-api-key"
 ```
 
@@ -139,21 +142,22 @@ curl http://localhost:8000/v1/tokens \
   -d '{"old_token":"old-token","new_token":"new-token"}'
 ```
 
-删除一个 token：
+禁用一个 token。`DELETE` 默认是软删除，会把 token 标为 `disabled` 并从上游轮询池移除；需要物理删除时显式加 `hard=true`：
 
 ```bash
-curl "http://localhost:8000/v1/tokens?token=your-zai-token" \
+curl "http://localhost:8000/v1/tokens?id=1" \
   -X DELETE \
   -H "Authorization: Bearer your-api-key"
 ```
 
 ## 上游 Token 规则
 
-- 主上游 token 池来自 `data/tokens.txt`，支持历史格式 `token=...`、空行和注释行。
-- `BACKUP_TOKEN` 会并入同一个内存池，但只有文件池 token 会被 `/v1/tokens` 直接增删改。
-- `/v1/tokens` 直接管理同一份 `data/tokens.txt`，不会引入额外数据库。
-- Token 刷新使用 z.ai Web 侧滚动会话机制：`GET https://chat.z.ai/api/v1/auths/` 返回新 token 后会替换旧 token，并把文件来源的新 token 写回 `data/tokens.txt`。
-- 临时网络失败不会删除 token；只有上游明确返回 `401/403` 时才会判定 token 失效。
+- 主上游 token 池来自 SQLite token ledger，默认文件是 `data/tokens.db`。
+- 历史 `data/tokens.txt` 和 `data/tokens_invalid.txt` 只在 SQLite ledger 初始化时导入一次，后续不再作为运行态真源。
+- `BACKUP_TOKEN` 会导入为 `env_backup` 来源的管理副本，后续刷新结果写入 SQLite；建议最终把长期 token 迁入 ledger。
+- `/v1/tokens` 默认返回 `active`、`invalid`、`disabled`、`rotated` 等状态记录，但不会回传完整 bearer。
+- Token 刷新使用 z.ai Web 侧滚动会话机制：`GET https://chat.z.ai/api/v1/auths/` 返回新 token 后会写入 SQLite，并把旧 token 保留为 `rotated` 记录。
+- 临时网络失败只更新检查时间，不删除 token；只有上游明确返回 `401/403` 时才会判定 token 失效并标为 `invalid`。
 - 当前版本没有匿名 token 获取，也没有自动注册链路。
 - 当没有任何上游 token 可用时，`/v1/chat/completions` 会返回 `503`。
 
@@ -162,8 +166,9 @@ curl "http://localhost:8000/v1/tokens?token=your-zai-token" \
 `/console` 是一个无前端构建步骤的单页控制台，直接由 Go 服务返回。
 
 - 统计区读取 `/` 的遥测数据，展示总调用、成功调用、失败调用、成功率、RPM、Token 用量和模型维度统计。
-- Token 区使用 `/v1/tokens`，支持列出、批量新增和删除 `data/tokens.txt` 中的上游 token。
-- `AUTH_TOKEN` 只保存在当前浏览器的 `localStorage`，请求时作为 `Authorization: Bearer ...` 发送给受保护接口。
+- Token 区使用 `/v1/tokens?status=all`，展示 active、invalid、disabled、rotated、source、使用次数、刷新时间和失效原因。
+- 默认只展示 `token_preview`，不会从 API 拉取完整 bearer；只有 `TOKEN_API_ALLOW_REVEAL=true` 且请求显式 `reveal=true` 时才会返回完整 token。
+- `AUTH_TOKEN` 默认只保存在当前浏览器的 `sessionStorage`；勾选 remember this browser 后才会写入 `localStorage`。
 
 ### Python (OpenAI SDK)
 
@@ -206,8 +211,9 @@ zai2api/
 │   ├── config.go         # 配置管理
 │   ├── models.go         # 模型定义
 │   ├── telemetry.go      # 遥测统计
-│   ├── token_api.go      # tokens.txt 管理 API
-│   ├── token_manager.go  # Token 管理
+│   ├── token_api.go      # Token ledger 管理 API
+│   ├── token_manager.go  # Token 轮询、刷新和运行态管理
+│   ├── token_store.go    # SQLite token ledger
 │   ├── tools.go          # 工具调用
 │   └── ...
 ├── .env.example          # 配置示例

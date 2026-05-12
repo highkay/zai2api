@@ -29,7 +29,6 @@ func setupChatRetryTokenManager() {
 		"upstream-token": {Token: "upstream-token", Valid: true},
 	}
 	tm.validTokens = []string{"upstream-token"}
-	tm.fileTokens = []string{"upstream-token"}
 	tokenManager = tm
 	tokenOnce = sync.Once{}
 	tokenOnce.Do(func() {})
@@ -146,6 +145,7 @@ func TestHandleChatCompletionsRefreshesTokenAfterUpstreamAuthFailure(t *testing.
 	}
 
 	tm := NewTokenManager(tempDir)
+	t.Cleanup(tm.Stop)
 	if err := tm.loadTokens(); err != nil {
 		t.Fatalf("load tokens: %v", err)
 	}
@@ -224,11 +224,8 @@ func TestHandleChatCompletionsRefreshesTokenAfterUpstreamAuthFailure(t *testing.
 		t.Fatalf("expected refreshed response content, got %s", rec.Body.String())
 	}
 
-	tokens, err := tm.readTokenEntriesFromFile()
-	if err != nil {
-		t.Fatalf("read token file: %v", err)
-	}
-	if len(tokens) != 1 || tokens[0] != "fresh.one.two" {
+	tokens := tm.ListTokenRecords(TokenListOptions{Status: TokenStatusActive, IncludeToken: true})
+	if len(tokens) != 1 || tokens[0].Token != "fresh.one.two" {
 		t.Fatalf("expected refreshed token to persist, got %+v", tokens)
 	}
 }

@@ -79,6 +79,9 @@ type TelemetryData struct {
 	AvgOutputTok    int64                  `json:"avg_output_tokens"`
 	ValidTokens     int                    `json:"valid_tokens"`
 	TotalTokens     int                    `json:"total_tokens"`
+	InvalidTokens   int                    `json:"invalid_tokens"`
+	DisabledTokens  int                    `json:"disabled_tokens"`
+	RotatedTokens   int                    `json:"rotated_tokens"`
 	MultimodalCalls int64                  `json:"multimodal_calls"`
 	TotalCalls      int64                  `json:"total_calls"`
 	SuccessCalls    int64                  `json:"success_calls"`
@@ -126,6 +129,9 @@ func GetTelemetryData() TelemetryData {
 		AvgOutputTok:    avgOut,
 		ValidTokens:     tmStats.ValidTokenCount,
 		TotalTokens:     tmStats.TotalTokenCount,
+		InvalidTokens:   tmStats.InvalidTokenCount,
+		DisabledTokens:  tmStats.DisabledTokenCount,
+		RotatedTokens:   tmStats.RotatedTokenCount,
 		MultimodalCalls: tmStats.MultimodalCount,
 		TotalCalls:      tmStats.TotalCalls,
 		SuccessCalls:    tmStats.SuccessCalls,
