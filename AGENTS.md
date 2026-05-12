@@ -263,6 +263,7 @@ Z.ai bearer 被当作可滚动续签的会话凭证处理：
 
 - `PORT`
 - `API_ENDPOINT`
+- `UPSTREAM_PROXY`
 - `AUTH_TOKEN`
 - `BACKUP_TOKEN`
 - `TOKEN_DB_PATH`
@@ -298,6 +299,7 @@ Z.ai bearer 被当作可滚动续签的会话凭证处理：
    - 最小成功调用只要求 `Authorization`、`Content-Type`、`X-FE-Version`
    - `X-Signature`、query token、cookie、`X-Region` 不是当前最小成功调用的硬门槛
    - 不要重放旧浏览器 `captcha_verify_param`， stale 值会触发 `F018` / `F019`
+   - 如果部署机器直连 `chat.z.ai` 返回边缘拦截页，应优先验证并配置 `UPSTREAM_PROXY`，不要把这种 405 误判为 OpenAI `/v1` 路由问题
    - 即使上游 `stream=false`，当前返回仍是 `text/event-stream`，下游非流式适配也要按 SSE 消费
 4. 改 streaming 逻辑时，必须同步验证：
    - reasoning 内容

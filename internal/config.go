@@ -14,6 +14,7 @@ type Config struct {
 
 	// API Configuration
 	APIEndpoint         string
+	UpstreamProxy       string
 	AuthTokens          []string // 支持多个 API Key（逗号分隔）
 	BackupTokens        []string // 支持多个 Backup Token（用于多模态，逗号分隔）
 	TokenDBPath         string
@@ -104,6 +105,7 @@ func LoadConfig() {
 
 		// API Configuration
 		APIEndpoint:         getEnvString("API_ENDPOINT", "https://chat.z.ai/api/v2/chat/completions"),
+		UpstreamProxy:       getEnvString("UPSTREAM_PROXY", ""),
 		AuthTokens:          getEnvStringSlice("AUTH_TOKEN"),
 		BackupTokens:        getEnvStringSlice("BACKUP_TOKEN"),
 		TokenDBPath:         getEnvString("TOKEN_DB_PATH", ""),

@@ -18,29 +18,43 @@ const BrowserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 
 var (
 	tlsClientMu sync.Mutex
-	tlsBySec    = map[int]tls_client.HttpClient{}
+	tlsByKey    = map[tlsClientCacheKey]tls_client.HttpClient{}
 )
 
-// TLSHTTPClient 返回按超时（秒）复用的 tls-client 实例；所有出站 HTTPS 应通过此处以统一指纹。
+type tlsClientCacheKey struct {
+	timeoutSeconds int
+	proxyURL       string
+}
+
+// TLSHTTPClient 返回按超时和上游代理配置复用的 tls-client 实例；所有出站 HTTPS 应通过此处以统一指纹。
 func TLSHTTPClient(timeout time.Duration) (tls_client.HttpClient, error) {
 	sec := int(timeout.Round(time.Second) / time.Second)
 	if sec < 1 {
 		sec = 1
 	}
+	proxyURL := ""
+	if Cfg != nil {
+		proxyURL = Cfg.UpstreamProxy
+	}
+	key := tlsClientCacheKey{timeoutSeconds: sec, proxyURL: proxyURL}
 	tlsClientMu.Lock()
 	defer tlsClientMu.Unlock()
-	if c, ok := tlsBySec[sec]; ok {
+	if c, ok := tlsByKey[key]; ok {
 		return c, nil
 	}
-	c, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(),
+	opts := []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(sec),
 		tls_client.WithClientProfile(DefaultBrowserProfile),
 		tls_client.WithRandomTLSExtensionOrder(),
-	)
+	}
+	if proxyURL != "" {
+		opts = append(opts, tls_client.WithProxyUrl(proxyURL))
+	}
+	c, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), opts...)
 	if err != nil {
 		return nil, fmt.Errorf("tls-client: %w", err)
 	}
-	tlsBySec[sec] = c
+	tlsByKey[key] = c
 	return c, nil
 }
 

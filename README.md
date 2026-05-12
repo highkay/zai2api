@@ -88,6 +88,7 @@ AUTH_TOKEN=your-api-key
 | 配置项 | 默认值 | 描述 |
 |--------|--------|------|
 | `PORT` | 8000 | 服务端口 |
+| `UPSTREAM_PROXY` | - | 上游 z.ai 请求使用的出口代理，支持 `http://`、`https://`、`socks5://`、`socks5h://` |
 | `AUTH_TOKEN` | - | API 认证令牌（支持多个，逗号分隔） |
 | `BACKUP_TOKEN` | - | 备用上游令牌（支持多个，逗号分隔） |
 | `TOKEN_DB_PATH` | `data/tokens.db` | SQLite token ledger 路径 |
@@ -205,6 +206,7 @@ print(response.choices[0].message.content)
 - 当前聊天入口是 `POST https://chat.z.ai/api/v2/chat/completions`；同路径 `GET` / `OPTIONS` 会返回 `405`。
 - 当前最小成功 header 是 `Authorization: Bearer <fresh user token>`、`Content-Type: application/json`、`X-FE-Version`。
 - 代理不再向聊天接口重放浏览器 query token、cookie、`X-Signature` 或旧 `captcha_verify_param`。
+- 如果部署机器直连 `chat.z.ai` 被边缘网络拦截，可设置 `UPSTREAM_PROXY` 让刷新 token、模型同步、文件上传和聊天请求统一走同一个出口。
 - 即使上游请求体 `stream=false`，z.ai 当前仍返回 `text/event-stream`，所以非流式路径也按 SSE 汇总后再输出 OpenAI JSON。
 
 ## 项目结构
