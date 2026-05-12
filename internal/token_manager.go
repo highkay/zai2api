@@ -313,6 +313,14 @@ func (tm *TokenManager) loadTokens() error {
 		return err
 	}
 
+	prunedRotated, err := tm.store.DeleteRotatedTokens()
+	if err != nil {
+		return err
+	}
+	if prunedRotated > 0 {
+		LogInfo("已自动删除历史 rotated token: %d", prunedRotated)
+	}
+
 	legacyActive, err := tm.readTokenEntriesFromFile()
 	if err != nil {
 		return err

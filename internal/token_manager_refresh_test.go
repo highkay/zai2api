@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestTokenManagerRefreshRotatesAndPersistsFileToken(t *testing.T) {
+func TestTokenManagerRefreshReplacesAndPrunesOldToken(t *testing.T) {
 	initTokenTests(t)
 
 	oldCfg := Cfg
@@ -46,8 +46,8 @@ func TestTokenManagerRefreshRotatesAndPersistsFileToken(t *testing.T) {
 	}
 
 	oldInfo, exists := tm.GetTokenInfo("old.one.two")
-	if !exists || oldInfo.Status != TokenStatusRotated {
-		t.Fatalf("old token should be retained as rotated record: %+v exists=%v", oldInfo, exists)
+	if exists {
+		t.Fatalf("old token should be hard-deleted after refresh, got %+v", oldInfo)
 	}
 	info, exists := tm.GetTokenInfo("new.one.two")
 	if !exists {
@@ -63,6 +63,10 @@ func TestTokenManagerRefreshRotatesAndPersistsFileToken(t *testing.T) {
 	tokens := tm.ListTokenRecords(TokenListOptions{Status: TokenStatusActive, IncludeToken: true})
 	if len(tokens) != 1 || tokens[0].Token != "new.one.two" {
 		t.Fatalf("unexpected persisted tokens: %+v", tokens)
+	}
+	rotated := tm.ListTokenRecords(TokenListOptions{Status: TokenStatusRotated, IncludeToken: true})
+	if len(rotated) != 0 {
+		t.Fatalf("rotated tokens should be pruned after refresh: %+v", rotated)
 	}
 }
 

@@ -219,7 +219,7 @@ Z.ai bearer 被当作可滚动续签的会话凭证处理：
 2. 首次初始化时会从历史 `data/tokens.txt` 导入 active token，从 `data/tokens_invalid.txt` 导入 invalid token；导入只执行一次。
 3. `BACKUP_TOKEN` 会导入为 `env_backup` 来源的管理副本，后续刷新结果写入 SQLite。
 4. 定时或鉴权失败时调用 `GET https://chat.z.ai/api/v1/auths/`。
-5. 如果返回新 token，就写入新的 active 记录，并把旧 token 标为 `rotated`。
+5. 如果返回新 token，就写入新的 active 记录，并自动物理删除旧 token。
 6. 临时网络失败只记录检查时间和日志，不删除 token。
 7. 只有明确的 `401/403` 会把 token 标为 `invalid` 并移出内存轮询池。
 

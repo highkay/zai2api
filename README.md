@@ -187,8 +187,8 @@ curl http://localhost:8000/v1/config \
 - 主上游 token 池来自 SQLite token ledger，默认文件是 `data/tokens.db`。
 - 历史 `data/tokens.txt` 和 `data/tokens_invalid.txt` 只在 SQLite ledger 初始化时导入一次，后续不再作为运行态真源。
 - `BACKUP_TOKEN` 会导入为 `env_backup` 来源的管理副本，后续刷新结果写入 SQLite；建议最终把长期 token 迁入 ledger。
-- `/v1/tokens` 默认返回 `active`、`invalid`、`disabled`、`rotated` 等状态记录，但不会回传完整 bearer。
-- Token 刷新使用 z.ai Web 侧滚动会话机制：`GET https://chat.z.ai/api/v1/auths/` 返回新 token 后会写入 SQLite，并把旧 token 保留为 `rotated` 记录。
+- `/v1/tokens` 默认返回 `active`、`invalid`、`disabled` 等状态记录，但不会回传完整 bearer。
+- Token 刷新使用 z.ai Web 侧滚动会话机制：`GET https://chat.z.ai/api/v1/auths/` 返回新 token 后会写入 SQLite，并自动物理删除旧 token。
 - 聊天调用前会尽量先刷新一次上游 token；如果刷新遇到临时网络失败，会继续使用仍处于 active 状态的旧 token。
 - 临时网络失败只更新检查时间，不删除 token；只有上游明确返回 `401/403` 时才会判定 token 失效并标为 `invalid`。
 - 当前版本没有匿名 token 获取，也没有自动注册链路。
@@ -200,7 +200,7 @@ curl http://localhost:8000/v1/config \
 
 - 统计区读取 `/` 的遥测数据，展示总调用、成功调用、失败调用、成功率、RPM、Token 用量和模型维度统计。
 - 运行时配置区使用 `/v1/config`，可在线切换 `UPSTREAM_PROXY`，代理密码只显示遮罩预览。
-- Token 区使用 `/v1/tokens?status=all`，展示 active、invalid、disabled、rotated、source、使用次数、刷新时间和失效原因。
+- Token 区使用 `/v1/tokens?status=all`，展示 active、invalid、disabled、source、使用次数、刷新时间和失效原因。
 - 默认只展示 `token_preview`，不会从 API 拉取完整 bearer；只有 `TOKEN_API_ALLOW_REVEAL=true` 且请求显式 `reveal=true` 时才会返回完整 token。
 - `AUTH_TOKEN` 默认只保存在当前浏览器的 `sessionStorage`；勾选 remember this browser 后才会写入 `localStorage`。
 

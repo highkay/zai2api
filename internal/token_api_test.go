@@ -79,8 +79,12 @@ func TestTokenManagerKeepsTokensTxtCompatibility(t *testing.T) {
 	}
 
 	allTokens := tm.ListTokenRecords(TokenListOptions{Status: "all", IncludeToken: true})
-	if len(allTokens) != 4 {
-		t.Fatalf("expected active plus rotated/disabled records, got %+v", allTokens)
+	if len(allTokens) != 3 {
+		t.Fatalf("expected active plus disabled records with old replacement pruned, got %+v", allTokens)
+	}
+	rotated := tm.ListTokenRecords(TokenListOptions{Status: TokenStatusRotated, IncludeToken: true})
+	if len(rotated) != 0 {
+		t.Fatalf("rotated replacement tokens should be pruned, got %+v", rotated)
 	}
 }
 
@@ -111,6 +115,39 @@ func TestTokenManagerImportsInvalidLegacyTokens(t *testing.T) {
 	}
 	if tm.ValidTokenCount() != 1 {
 		t.Fatalf("invalid token should not enter upstream pool")
+	}
+}
+
+func TestTokenManagerLoadPrunesHistoricalRotatedTokens(t *testing.T) {
+	initTokenTests(t)
+
+	tempDir := t.TempDir()
+	tm := NewTokenManager(tempDir)
+	t.Cleanup(tm.Stop)
+	if err := tm.loadTokens(); err != nil {
+		t.Fatalf("load tokens: %v", err)
+	}
+	if _, _, err := tm.AddTokens([]string{"old.rotated.token", "active.one.two"}); err != nil {
+		t.Fatalf("add tokens: %v", err)
+	}
+	if _, err := tm.SetTokenStatus("old.rotated.token", TokenStatusRotated, "legacy rotated residue"); err != nil {
+		t.Fatalf("mark rotated: %v", err)
+	}
+	rotated := tm.ListTokenRecords(TokenListOptions{Status: TokenStatusRotated, IncludeToken: true})
+	if len(rotated) != 1 {
+		t.Fatalf("expected rotated setup row, got %+v", rotated)
+	}
+
+	if err := tm.loadTokens(); err != nil {
+		t.Fatalf("reload tokens: %v", err)
+	}
+	rotated = tm.ListTokenRecords(TokenListOptions{Status: TokenStatusRotated, IncludeToken: true})
+	if len(rotated) != 0 {
+		t.Fatalf("historical rotated rows should be pruned, got %+v", rotated)
+	}
+	active := tm.ListTokenRecords(TokenListOptions{Status: TokenStatusActive, IncludeToken: true})
+	if len(active) != 1 || active[0].Token != "active.one.two" {
+		t.Fatalf("active token should be preserved, got %+v", active)
 	}
 }
 

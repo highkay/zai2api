@@ -65,6 +65,7 @@ type TokenStore interface {
 	SetTokenStatusByID(id int64, status, reason string) (TokenInfo, error)
 	DeleteToken(token string, hard bool) (TokenInfo, error)
 	DeleteTokenByID(id int64, hard bool) (TokenInfo, error)
+	DeleteRotatedTokens() (int64, error)
 	IncrementUse(token string) error
 }
 
@@ -407,16 +408,10 @@ func (s *SQLiteTokenStore) ReplaceToken(oldToken, newToken, email, userID string
 	if err != nil {
 		return TokenInfo{}, false, err
 	}
-	_, err = tx.Exec(
-		`UPDATE tokens
-		 SET status = ?, last_checked_at = ?, last_refreshed_at = ?, replaced_by_id = ?, updated_at = ?
-		 WHERE id = ?`,
-		TokenStatusRotated, formatTimeForStore(checkedAt), formatTimeForStore(checkedAt), newInfo.ID, formatTimeForStore(now), oldInfo.ID,
-	)
-	if err != nil {
+	if err := addTokenEventTx(tx, oldInfo.ID, "rotated_deleted", oldInfo.Status, "", tokenPreview(newToken), now); err != nil {
 		return TokenInfo{}, false, err
 	}
-	if err := addTokenEventTx(tx, oldInfo.ID, "rotated", oldInfo.Status, TokenStatusRotated, tokenPreview(newToken), now); err != nil {
+	if _, err := tx.Exec(`DELETE FROM tokens WHERE id = ?`, oldInfo.ID); err != nil {
 		return TokenInfo{}, false, err
 	}
 	return newInfo, inserted, tx.Commit()
@@ -581,6 +576,49 @@ func (s *SQLiteTokenStore) DeleteTokenByID(id int64, hard bool) (TokenInfo, erro
 		return TokenInfo{}, ErrTokenNotFound
 	}
 	return s.deleteTokenByInfo(info, hard)
+}
+
+func (s *SQLiteTokenStore) DeleteRotatedTokens() (int64, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`SELECT id FROM tokens WHERE status = ?`, TokenStatusRotated)
+	if err != nil {
+		return 0, err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+
+	now := time.Now()
+	for _, id := range ids {
+		if err := addTokenEventTx(tx, id, "rotated_pruned", TokenStatusRotated, "", "auto delete rotated token", now); err != nil {
+			return 0, err
+		}
+	}
+	result, err := tx.Exec(`DELETE FROM tokens WHERE status = ?`, TokenStatusRotated)
+	if err != nil {
+		return 0, err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return count, tx.Commit()
 }
 
 func (s *SQLiteTokenStore) deleteTokenByInfo(info TokenInfo, hard bool) (TokenInfo, error) {

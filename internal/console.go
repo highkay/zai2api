@@ -194,7 +194,6 @@ const consoleHTML = `<!doctype html>
             <option value="active">active</option>
             <option value="invalid">invalid</option>
             <option value="disabled">disabled</option>
-            <option value="rotated">rotated</option>
           </select>
           <select id="source-filter">
             <option value="">all sources</option>
@@ -324,7 +323,7 @@ const consoleHTML = `<!doctype html>
       $("failed-calls").textContent = number(failed);
       $("success-rate").textContent = percent(t.success_rate);
       $("valid-tokens").textContent = number(t.valid_tokens);
-      $("total-tokens").textContent = "total " + number(t.total_tokens || 0) + " / invalid " + number(t.invalid_tokens || 0) + " / disabled " + number(t.disabled_tokens || 0) + " / rotated " + number(t.rotated_tokens || 0);
+      $("total-tokens").textContent = "total " + number(t.total_tokens || 0) + " / invalid " + number(t.invalid_tokens || 0) + " / disabled " + number(t.disabled_tokens || 0);
       $("rpm").textContent = number(t.rpm);
       $("uptime").textContent = "uptime " + (t.uptime || "0s");
       $("token-usage").textContent = number(Number(t.total_input_tokens || 0) + Number(t.total_output_tokens || 0));
@@ -417,7 +416,7 @@ const consoleHTML = `<!doctype html>
     function renderSummary(summary) {
       const box = $("token-summary");
       box.replaceChildren();
-      [["total", "total"], ["active", "active"], ["invalid", "invalid"], ["disabled", "disabled"], ["rotated", "rotated"]].forEach(([key, label]) => {
+      [["total", "total"], ["active", "active"], ["invalid", "invalid"], ["disabled", "disabled"]].forEach(([key, label]) => {
         const pill = document.createElement("span");
         pill.className = "pill";
         pill.textContent = label + " " + number(summary[key] || 0);
