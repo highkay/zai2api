@@ -157,6 +157,7 @@ curl "http://localhost:8000/v1/tokens?id=1" \
 - `BACKUP_TOKEN` 会导入为 `env_backup` 来源的管理副本，后续刷新结果写入 SQLite；建议最终把长期 token 迁入 ledger。
 - `/v1/tokens` 默认返回 `active`、`invalid`、`disabled`、`rotated` 等状态记录，但不会回传完整 bearer。
 - Token 刷新使用 z.ai Web 侧滚动会话机制：`GET https://chat.z.ai/api/v1/auths/` 返回新 token 后会写入 SQLite，并把旧 token 保留为 `rotated` 记录。
+- 聊天调用前会尽量先刷新一次上游 token；如果刷新遇到临时网络失败，会继续使用仍处于 active 状态的旧 token。
 - 临时网络失败只更新检查时间，不删除 token；只有上游明确返回 `401/403` 时才会判定 token 失效并标为 `invalid`。
 - 当前版本没有匿名 token 获取，也没有自动注册链路。
 - 当没有任何上游 token 可用时，`/v1/chat/completions` 会返回 `503`。
@@ -198,6 +199,13 @@ print(response.choices[0].message.content)
   `GLM-5-Turbo`
   `GLM-5v-Turbo`
   `GLM-5.1`
+
+## Z.ai 聊天对接契约
+
+- 当前聊天入口是 `POST https://chat.z.ai/api/v2/chat/completions`；同路径 `GET` / `OPTIONS` 会返回 `405`。
+- 当前最小成功 header 是 `Authorization: Bearer <fresh user token>`、`Content-Type: application/json`、`X-FE-Version`。
+- 代理不再向聊天接口重放浏览器 query token、cookie、`X-Signature` 或旧 `captcha_verify_param`。
+- 即使上游请求体 `stream=false`，z.ai 当前仍返回 `text/event-stream`，所以非流式路径也按 SSE 汇总后再输出 OpenAI JSON。
 
 ## 项目结构
 

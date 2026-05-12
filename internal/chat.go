@@ -48,6 +48,15 @@ const (
 	ErrTypeUpstream       = "upstream_error"
 )
 
+const defaultChatAPIEndpoint = "https://chat.z.ai/api/v2/chat/completions"
+
+func chatAPIEndpoint() string {
+	if Cfg != nil && strings.TrimSpace(Cfg.APIEndpoint) != "" {
+		return Cfg.APIEndpoint
+	}
+	return defaultChatAPIEndpoint
+}
+
 // writeError 写入错误响应
 func writeError(w http.ResponseWriter, statusCode int, errType, message, code string) {
 	w.Header().Set("Content-Type", "application/json")
@@ -125,22 +134,39 @@ func extractAllMediaURLs(messages []Message) (imageURLs, videoURLs []string) {
 
 var makeUpstreamRequestFunc = makeUpstreamRequest
 
-func makeUpstreamRequest(ctx context.Context, token string, messages []Message, model string, imageURLs, videoURLs []string, hasTools bool) (*fhttp.Response, string, error) {
+func makeUpstreamRequest(ctx context.Context, token string, messages []Message, model string, stream bool, imageURLs, videoURLs []string, hasTools bool) (*fhttp.Response, string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	requestCtx, cancel := deriveCancelableRequestContext(ctx)
 	defer cancel()
 
-	payload, err := DecodeJWTPayload(token)
-	if err != nil || payload == nil {
-		return nil, "", fmt.Errorf("invalid token")
+	req, targetModel, err := buildUpstreamChatRequest(requestCtx, token, messages, model, stream, imageURLs, videoURLs, hasTools)
+	if err != nil {
+		return nil, "", err
 	}
 
-	userID := payload.ID
-	chatID := uuid.New().String()
-	timestamp := time.Now().UnixMilli()
-	requestID := uuid.New().String()
+	client, err := TLSHTTPClient(300 * time.Second)
+	if err != nil {
+		return nil, "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+
+	LogDebug("Upstream response: status=%d", resp.StatusCode)
+	return resp, targetModel, nil
+}
+
+func buildUpstreamChatRequest(ctx context.Context, token string, messages []Message, model string, stream bool, imageURLs, videoURLs []string, hasTools bool) (*fhttp.Request, string, error) {
+	if strings.TrimSpace(token) == "" {
+		return nil, "", fmt.Errorf("empty upstream token")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	userMsgID := uuid.New().String()
 
 	// 使用新的模型映射系统
@@ -186,21 +212,13 @@ func makeUpstreamRequest(ctx context.Context, token string, messages []Message, 
 
 	latestUserContent := extractLatestUserContent(messages)
 
-	signature := GenerateSignature(userID, requestID, latestUserContent, timestamp)
-
-	url := fmt.Sprintf("%s?timestamp=%d&requestId=%s&user_id=%s&version=0.0.1&platform=web&token=%s&current_url=%s&pathname=%s&signature_timestamp=%d",
-		Cfg.APIEndpoint, timestamp, requestID, userID, token,
-		fmt.Sprintf("https://chat.z.ai/c/%s", chatID),
-		fmt.Sprintf("/c/%s", chatID),
-		timestamp)
-
 	urlToFileID := make(map[string]string)
 	var filesData []map[string]interface{}
 
 	// 上传图片
 	if len(imageURLs) > 0 {
 		LogDebug("[Upstream] Uploading %d images...", len(imageURLs))
-		imageFiles, err := UploadImages(requestCtx, token, imageURLs)
+		imageFiles, err := UploadImages(ctx, token, imageURLs)
 		if err != nil {
 			return nil, "", err
 		}
@@ -228,7 +246,7 @@ func makeUpstreamRequest(ctx context.Context, token string, messages []Message, 
 	// 上传视频
 	if len(videoURLs) > 0 {
 		LogDebug("[Upstream] Uploading %d videos...", len(videoURLs))
-		videoFiles, err := UploadVideos(requestCtx, token, videoURLs)
+		videoFiles, err := UploadVideos(ctx, token, videoURLs)
 		if err != nil {
 			return nil, "", err
 		}
@@ -258,21 +276,24 @@ func makeUpstreamRequest(ctx context.Context, token string, messages []Message, 
 	}
 
 	body := map[string]interface{}{
-		"stream":           true,
-		"model":            targetModel,
-		"messages":         upstreamMessages,
-		"signature_prompt": latestUserContent,
-		"params":           map[string]interface{}{},
-		"features": map[string]interface{}{
-			"image_generation": true,
-			"web_search":       true,
-			"auto_web_search":  autoWebSearch && !hasTools,
-			"preview_mode":     false,
-			"flags":            []string{},
-			"enable_thinking":  enableThinking,
-		},
-		"chat_id": chatID,
-		"id":      uuid.New().String(),
+		"stream":   stream,
+		"model":    targetModel,
+		"messages": upstreamMessages,
+	}
+
+	features := make(map[string]interface{})
+	if enableThinking {
+		features["enable_thinking"] = true
+	}
+	if autoWebSearch && !hasTools {
+		features["web_search"] = true
+		features["auto_web_search"] = true
+	}
+	if len(imageURLs) > 0 || len(videoURLs) > 0 {
+		features["image_generation"] = true
+	}
+	if len(features) > 0 {
+		body["features"] = features
 	}
 
 	if len(mcpServers) > 0 {
@@ -290,37 +311,18 @@ func makeUpstreamRequest(ctx context.Context, token string, messages []Message, 
 
 	bodyBytes, _ := json.Marshal(body)
 
-	req, err := fhttp.NewRequestWithContext(requestCtx, "POST", url, bytes.NewReader(bodyBytes))
+	req, err := fhttp.NewRequestWithContext(ctx, "POST", chatAPIEndpoint(), bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, "", err
 	}
-
-	randomIP := generateRandomIP()
 
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-FE-Version", GetFeVersion())
-	req.Header.Set("X-Signature", signature)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Origin", "https://chat.z.ai")
-	req.Header.Set("Referer", fmt.Sprintf("https://chat.z.ai/c/%s", chatID))
-	ApplyBrowserFingerprintHeaders(req.Header)
-	req.Header.Set("X-Forwarded-For", randomIP)
-	req.Header.Set("X-Real-IP", randomIP)
 
-	LogDebug("Upstream request: model=%s, messages=%d, XFF=%s", targetModel, len(messages), randomIP)
-
-	client, err := TLSHTTPClient(300 * time.Second)
-	if err != nil {
-		return nil, "", err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, "", err
-	}
-
-	LogDebug("Upstream response: status=%d, XFF=%s", resp.StatusCode, randomIP)
-	return resp, targetModel, nil
+	LogDebug("Upstream request: model=%s, messages=%d, stream=%v, fe=%s, prompt_len=%d, files=%d",
+		targetModel, len(messages), stream, GetFeVersion(), len(latestUserContent), len(filesData))
+	return req, targetModel, nil
 }
 
 type UpstreamData struct {
@@ -561,7 +563,7 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var token string
-	if token = GetUpstreamToken(); token == "" {
+	if token = GetFreshUpstreamToken(); token == "" {
 		LogError("No upstream token available")
 		GetTokenManager().RecordCall(false, false)
 		writeError(w, http.StatusServiceUnavailable, ErrTypeServer, "No upstream token available", "upstream_token_unavailable")
@@ -639,7 +641,7 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		resp, modelName, err := makeUpstreamRequestFunc(ctx, token, messages, req.Model, reqImageURLs, reqVideoURLs, len(req.Tools) > 0)
+		resp, modelName, err := makeUpstreamRequestFunc(ctx, token, messages, req.Model, req.Stream, reqImageURLs, reqVideoURLs, len(req.Tools) > 0)
 		if err != nil {
 			if isContextCanceled(err) || isContextCanceled(ctx.Err()) {
 				LogInfo("Client request canceled during upstream request: %v", err)

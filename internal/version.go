@@ -9,14 +9,19 @@ import (
 	fhttp "github.com/bogdanfinn/fhttp"
 )
 
+const DefaultFeVersion = "prod-fe-1.1.29"
+
 var (
-	feVersion   string
+	feVersion   = DefaultFeVersion
 	versionLock sync.RWMutex
 )
 
 func GetFeVersion() string {
 	versionLock.RLock()
 	defer versionLock.RUnlock()
+	if feVersion == "" {
+		return DefaultFeVersion
+	}
 	return feVersion
 }
 

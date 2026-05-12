@@ -123,45 +123,30 @@
 
 它会：
 
-1. 解析上游 token 的 JWT，取出 `user_id`
-2. 生成：
-  - `chat_id`
-  - `request_id`
-  - `user_msg_id`
-  - `timestamp`
-3. 基于请求模型查 `GetUpstreamConfig`，得到：
+1. 基于请求模型查 `GetUpstreamConfig`，得到：
   - 实际上游模型 ID
   - 是否开启 thinking
   - 是否开启自动搜索
   - 需要附带的 `mcp_servers`
-4. 从最新 user 消息提取文本，生成 `X-Signature`
-5. 拼出上游 URL：
+2. 拼出上游 URL：
   - 默认 `API_ENDPOINT=https://chat.z.ai/api/v2/chat/completions`
-  - query 中附带 `timestamp`、`requestId`、`user_id`、`token`、`current_url`、`pathname` 等 Web 侧参数
-6. 若消息包含图片/视频：
+  - 当前聊天调用使用裸 `POST` endpoint，不再重放浏览器 query token、`current_url` 或签名参数
+3. 若消息包含图片/视频：
   - 调 `UploadImages` / `UploadVideos`
   - 先把媒体上传到 `https://chat.z.ai/api/v1/files/`
   - 建立 `原始 URL -> z.ai file ID` 映射
-7. 调每条消息的 `ToUpstreamMessage`，把 OpenAI 内容改成上游可接受结构
-8. 组装最终 JSON body：
+4. 调每条消息的 `ToUpstreamMessage`，把 OpenAI 内容改成上游可接受结构
+5. 组装最终 JSON body：
   - `stream`
   - `model`
   - `messages`
-  - `signature_prompt`
-  - `features`
-  - `mcp_servers`
-  - `files`
-  - `current_user_message_id`
-9. 给请求补充 z.ai Web 所需头：
+  - 按能力需要附带 `features` / `mcp_servers`
+  - 多模态时附带 `files` / `current_user_message_id`
+6. 给请求补充 z.ai Web 所需头：
   - `Authorization`
   - `X-FE-Version`
-  - `X-Signature`
-  - `Origin`
-  - `Referer`
-  - 浏览器 UA / `sec-ch-ua`
-  - `X-Forwarded-For`
-  - `X-Real-IP`
-10. 通过 `TLSHTTPClient()` 发送请求，保持浏览器风格 TLS/HTTP2 指纹
+  - `Content-Type`
+7. 通过 `TLSHTTPClient()` 发送请求，保持浏览器风格 TLS/HTTP2 指纹
 
 ### 3. 流式响应适配
 
@@ -308,20 +293,26 @@ Z.ai bearer 被当作可滚动续签的会话凭证处理：
    - `internal/upload.go`
    - `internal/tls_http.go`
    - `internal/version.go`
-3. 改 streaming 逻辑时，必须同步验证：
+3. 最新 live 合约结论：
+   - `POST https://chat.z.ai/api/v2/chat/completions` 是当前聊天入口，`GET` / `OPTIONS` 仍会 `405`
+   - 最小成功调用只要求 `Authorization`、`Content-Type`、`X-FE-Version`
+   - `X-Signature`、query token、cookie、`X-Region` 不是当前最小成功调用的硬门槛
+   - 不要重放旧浏览器 `captcha_verify_param`， stale 值会触发 `F018` / `F019`
+   - 即使上游 `stream=false`，当前返回仍是 `text/event-stream`，下游非流式适配也要按 SSE 消费
+4. 改 streaming 逻辑时，必须同步验证：
    - reasoning 内容
    - 普通 content
    - tool_calls
    - usage chunk
    - `[DONE]`
-4. 改模型映射时，必须同时检查：
+5. 改模型映射时，必须同时检查：
    - `IsValidModel`
    - `GetUpstreamConfig`
    - `/v1/models` 输出
    - thinking/search 后缀行为
-5. 改媒体逻辑时，不要只改消息解析；上传接口、`files` 结构和回填映射必须一起验证
-6. 改上游请求头或 TLS 逻辑时，`X-FE-Version`、`X-Signature`、浏览器指纹头和 `TLSHTTPClient()` 需要一起看，不能只改单点
-7. 改控制台时，不要新增独立状态源；优先复用 `/` 遥测和 `/v1/tokens`，并保持 token 本体在页面上遮罩显示
+6. 改媒体逻辑时，不要只改消息解析；上传接口、`files` 结构和回填映射必须一起验证
+7. 改上游请求头或 TLS 逻辑时，`X-FE-Version`、最小 header 契约和 `TLSHTTPClient()` 需要一起看，不能只改单点
+8. 改控制台时，不要新增独立状态源；优先复用 `/` 遥测和 `/v1/tokens`，并保持 token 本体在页面上遮罩显示
 
 ## 构建与验证
 

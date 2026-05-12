@@ -19,8 +19,15 @@ import (
 
 func initChatRetryTests(t *testing.T) {
 	t.Helper()
+	oldFetch := fetchAuthSessionFunc
 	Cfg = &Config{}
 	InitLogger()
+	fetchAuthSessionFunc = func(token string) (authSessionResponse, int, error) {
+		return authSessionResponse{Token: token}, http.StatusOK, nil
+	}
+	t.Cleanup(func() {
+		fetchAuthSessionFunc = oldFetch
+	})
 }
 
 func setupChatRetryTokenManager() {
@@ -50,7 +57,7 @@ func TestHandleChatCompletionsStopsRetryingOnUpstreamConcurrencyLimit(t *testing
 	})
 
 	attempts := 0
-	makeUpstreamRequestFunc = func(ctx context.Context, token string, messages []Message, model string, imageURLs, videoURLs []string, hasTools bool) (*fhttp.Response, string, error) {
+	makeUpstreamRequestFunc = func(ctx context.Context, token string, messages []Message, model string, stream bool, imageURLs, videoURLs []string, hasTools bool) (*fhttp.Response, string, error) {
 		attempts++
 		sse := "data: {\"type\":\"chat:completion\",\"data\":{\"done\":true,\"error\":{\"code\":429,\"detail\":\"Your current concurrent conversation limit has been reached. Please try again later.\"}}}\n\n" +
 			"data: [DONE]\n\n"
@@ -106,7 +113,7 @@ func TestHandleChatCompletionsStopsWhenRequestContextCanceled(t *testing.T) {
 
 	attempts := 0
 	cancelCtx, cancel := context.WithCancel(context.Background())
-	makeUpstreamRequestFunc = func(ctx context.Context, token string, messages []Message, model string, imageURLs, videoURLs []string, hasTools bool) (*fhttp.Response, string, error) {
+	makeUpstreamRequestFunc = func(ctx context.Context, token string, messages []Message, model string, stream bool, imageURLs, videoURLs []string, hasTools bool) (*fhttp.Response, string, error) {
 		attempts++
 		cancel()
 		return nil, "", context.Canceled
@@ -163,9 +170,14 @@ func TestHandleChatCompletionsRefreshesTokenAfterUpstreamAuthFailure(t *testing.
 		AuthTokens: []string{"admin-key"},
 		RetryCount: 1,
 	}
+	refreshCalls := 0
 	fetchAuthSessionFunc = func(token string) (authSessionResponse, int, error) {
 		if token != "stale.one.two" {
 			t.Fatalf("unexpected refresh token: %s", token)
+		}
+		refreshCalls++
+		if refreshCalls == 1 {
+			return authSessionResponse{Token: "stale.one.two"}, http.StatusOK, nil
 		}
 		return authSessionResponse{Token: "fresh.one.two"}, http.StatusOK, nil
 	}
@@ -176,7 +188,7 @@ func TestHandleChatCompletionsRefreshesTokenAfterUpstreamAuthFailure(t *testing.
 	})
 
 	attempts := 0
-	makeUpstreamRequestFunc = func(ctx context.Context, token string, messages []Message, model string, imageURLs, videoURLs []string, hasTools bool) (*fhttp.Response, string, error) {
+	makeUpstreamRequestFunc = func(ctx context.Context, token string, messages []Message, model string, stream bool, imageURLs, videoURLs []string, hasTools bool) (*fhttp.Response, string, error) {
 		attempts++
 		if attempts == 1 {
 			if token != "stale.one.two" {
@@ -227,5 +239,78 @@ func TestHandleChatCompletionsRefreshesTokenAfterUpstreamAuthFailure(t *testing.
 	tokens := tm.ListTokenRecords(TokenListOptions{Status: TokenStatusActive, IncludeToken: true})
 	if len(tokens) != 1 || tokens[0].Token != "fresh.one.two" {
 		t.Fatalf("expected refreshed token to persist, got %+v", tokens)
+	}
+}
+
+func TestHandleChatCompletionsRefreshesTokenBeforeChatCall(t *testing.T) {
+	initChatRetryTests(t)
+
+	tempDir := t.TempDir()
+	tokenFile := filepath.Join(tempDir, "tokens.txt")
+	if err := os.WriteFile(tokenFile, []byte("stored.one.two\n"), 0644); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	tm := NewTokenManager(tempDir)
+	t.Cleanup(tm.Stop)
+	if err := tm.loadTokens(); err != nil {
+		t.Fatalf("load tokens: %v", err)
+	}
+	tokenManager = tm
+	tokenOnce = sync.Once{}
+	tokenOnce.Do(func() {})
+
+	oldCfg := Cfg
+	oldMakeUpstreamRequest := makeUpstreamRequestFunc
+	oldFetch := fetchAuthSessionFunc
+	Cfg = &Config{
+		AuthTokens: []string{"admin-key"},
+		RetryCount: 0,
+	}
+	fetchAuthSessionFunc = func(token string) (authSessionResponse, int, error) {
+		if token != "stored.one.two" {
+			t.Fatalf("unexpected refresh token: %s", token)
+		}
+		return authSessionResponse{Token: "fresh.one.two"}, http.StatusOK, nil
+	}
+	t.Cleanup(func() {
+		Cfg = oldCfg
+		makeUpstreamRequestFunc = oldMakeUpstreamRequest
+		fetchAuthSessionFunc = oldFetch
+	})
+
+	makeUpstreamRequestFunc = func(ctx context.Context, token string, messages []Message, model string, stream bool, imageURLs, videoURLs []string, hasTools bool) (*fhttp.Response, string, error) {
+		if token != "fresh.one.two" {
+			t.Fatalf("expected refreshed token before upstream call, got %s", token)
+		}
+		sse := "data: {\"type\":\"chat:completion\",\"data\":{\"phase\":\"answer\",\"delta_content\":\"preflight ok\"}}\n\n" +
+			"data: {\"type\":\"chat:completion\",\"data\":{\"phase\":\"done\",\"done\":true}}\n\n" +
+			"data: [DONE]\n\n"
+		return &fhttp.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewBufferString(sse)),
+		}, "GLM-5.1", nil
+	}
+
+	body := map[string]interface{}{
+		"model": "GLM-5.1",
+		"messages": []map[string]string{
+			{"role": "user", "content": "hello"},
+		},
+		"stream": false,
+	}
+	payload, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer admin-key")
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	HandleChatCompletions(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "preflight ok") {
+		t.Fatalf("expected response content, got %s", rec.Body.String())
 	}
 }

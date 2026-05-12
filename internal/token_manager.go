@@ -720,6 +720,25 @@ func GetUpstreamToken() string {
 	return ""
 }
 
+func GetFreshUpstreamToken() string {
+	tm := GetTokenManager()
+	attempts := tm.ValidTokenCount()
+	for i := 0; i < attempts; i++ {
+		token := tm.GetToken()
+		if token == "" {
+			break
+		}
+		outcome := tm.RefreshToken(token, true)
+		switch {
+		case outcome.Valid && outcome.Token != "":
+			return outcome.Token
+		case outcome.Valid:
+			return token
+		}
+	}
+	return ""
+}
+
 func GetUpstreamTokenForModelAPI() (string, error) {
 	token := GetUpstreamToken()
 	if token == "" {
