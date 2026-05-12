@@ -113,6 +113,18 @@ func writeUpstreamError(w http.ResponseWriter, statusCode int, upstreamBody []by
 	writeError(w, statusCode, ErrTypeUpstream, message, "upstream_error")
 }
 
+func isUpstreamEdgeBlockedResponse(statusCode int, contentType string, body []byte) bool {
+	if statusCode != http.StatusMethodNotAllowed {
+		return false
+	}
+	normalizedContentType := strings.ToLower(contentType)
+	bodyLower := strings.ToLower(string(body[:min(len(body), 1000)]))
+	return strings.Contains(normalizedContentType, "text/html") ||
+		strings.Contains(bodyLower, "errors.aliyun.com") ||
+		strings.Contains(bodyLower, "<title>405</title>") ||
+		strings.Contains(bodyLower, "<!doctypehtml")
+}
+
 func extractLatestUserContent(messages []Message) string {
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role == "user" {
@@ -717,6 +729,11 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			resp.Body.Close()
 			LogError("Upstream error (attempt %d): status=%d, body=%s", attempt+1, resp.StatusCode, string(body)[:min(500, len(body))])
 			lastError = fmt.Sprintf("status %d", resp.StatusCode)
+			if isUpstreamEdgeBlockedResponse(resp.StatusCode, resp.Header.Get("Content-Type"), body) {
+				GetTokenManager().RecordCall(false, isMultimodal)
+				writeError(w, http.StatusBadGateway, ErrTypeUpstream, "上游边缘层拦截当前出口，请配置 UPSTREAM_PROXY 或切换出口", "upstream_edge_blocked")
+				return
+			}
 			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 				if newToken, ok := refreshChatSessionForRetry(token, "Upstream auth failed"); ok {
 					token = newToken

@@ -222,8 +222,9 @@ Z.ai bearer 被当作可滚动续签的会话凭证处理：
 5. 如果返回新 token，就写入新的 active 记录，并自动物理删除旧 token。
 6. 如果聊天 SSE 返回 `Please refresh the page to update the app`，代理会重新抓取 `X-FE-Version` 并强制续签 bearer 后再重放请求。
 7. 如果上游业务码是 `FRONTEND_CAPTCHA_REQUIRED`，代理会直接返回 `frontend_captcha_required`，因为这通常是当前出口或会话需要 fresh captcha，不应靠重试 token 解决。
-8. 临时网络失败只记录检查时间和日志，不删除 token。
-9. 只有明确的 `401/403` 会把 token 标为 `invalid` 并移出内存轮询池。
+8. 如果上游返回 `405` 且响应是 HTML/Aliyun 错误页，代理会返回 `upstream_edge_blocked`，表示当前出口在边缘层被拦截，应切换 `UPSTREAM_PROXY`。
+9. 临时网络失败只记录检查时间和日志，不删除 token。
+10. 只有明确的 `401/403` 会把 token 标为 `invalid` 并移出内存轮询池。
 
 ## 工具调用实现方式
 
@@ -307,6 +308,7 @@ Z.ai bearer 被当作可滚动续签的会话凭证处理：
    - `X-Signature`、query token、cookie、`X-Region` 不是当前最小成功调用的硬门槛
    - 不要重放旧浏览器 `captcha_verify_param`， stale 值会触发 `F018` / `F019`
    - 如果部署机器直连 `chat.z.ai` 返回边缘拦截页，应优先验证并配置 `UPSTREAM_PROXY`，不要把这种 405 误判为 OpenAI `/v1` 路由问题
+   - `405 text/html` 通常是出口/IP/边缘路由拦截，不是 z.ai chat 应用层验证码；只有 `200 text/event-stream` 内的 `FRONTEND_CAPTCHA_REQUIRED` 才进入 captcha 问题域
    - 即使上游 `stream=false`，当前返回仍是 `text/event-stream`，下游非流式适配也要按 SSE 消费
 4. 改 streaming 逻辑时，必须同步验证：
    - reasoning 内容

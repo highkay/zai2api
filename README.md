@@ -192,6 +192,7 @@ curl http://localhost:8000/v1/config \
 - 聊天调用前会尽量先刷新一次上游 token；如果刷新遇到临时网络失败，会继续使用仍处于 active 状态的旧 token。
 - 如果聊天 SSE 返回 `Please refresh the page to update the app`，代理会重新抓取 `X-FE-Version` 并强制续签 bearer 后再重放请求。
 - 如果上游业务码是 `FRONTEND_CAPTCHA_REQUIRED`，代理会直接返回 `frontend_captcha_required`，因为这通常是当前出口或会话需要 fresh captcha，不应靠重试 token 解决。
+- 如果上游返回 `405` 且响应是 HTML/Aliyun 错误页，代理会返回 `upstream_edge_blocked`，表示当前出口在边缘层被拦截，应切换 `UPSTREAM_PROXY`。
 - 临时网络失败只更新检查时间，不删除 token；只有上游明确返回 `401/403` 时才会判定 token 失效并标为 `invalid`。
 - 当前版本没有匿名 token 获取，也没有自动注册链路。
 - 当没有任何上游 token 可用时，`/v1/chat/completions` 会返回 `503`。
@@ -241,6 +242,7 @@ print(response.choices[0].message.content)
 - 当前最小成功 header 是 `Authorization: Bearer <fresh user token>`、`Content-Type: application/json`、`X-FE-Version`。
 - 代理不再向聊天接口重放浏览器 query token、cookie、`X-Signature` 或旧 `captcha_verify_param`。
 - 如果部署机器直连 `chat.z.ai` 被边缘网络拦截，可设置 `UPSTREAM_PROXY` 让刷新 token、模型同步、文件上传和聊天请求统一走同一个出口。
+- `405 text/html` 通常是出口/IP/边缘路由拦截，不是 z.ai chat 应用层验证码；只有 `200 text/event-stream` 内的 `FRONTEND_CAPTCHA_REQUIRED` 才进入 captcha 问题域。
 - 使用本仓库 Docker Compose 时，如果代理在宿主机上，可设置 `UPSTREAM_PROXY=http://host.docker.internal:7890`。
 - 即使上游请求体 `stream=false`，z.ai 当前仍返回 `text/event-stream`，所以非流式路径也按 SSE 汇总后再输出 OpenAI JSON。
 

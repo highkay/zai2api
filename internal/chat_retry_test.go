@@ -160,6 +160,59 @@ func TestHandleChatCompletionsStopsRetryingOnUpstreamCaptchaRequired(t *testing.
 	}
 }
 
+func TestHandleChatCompletionsClassifiesUpstreamEdgeBlockedHTML(t *testing.T) {
+	initChatRetryTests(t)
+	setupChatRetryTokenManager()
+
+	oldCfg := Cfg
+	oldMakeUpstreamRequest := makeUpstreamRequestFunc
+	Cfg = &Config{
+		AuthTokens: []string{"admin-key"},
+		RetryCount: 5,
+	}
+	t.Cleanup(func() {
+		Cfg = oldCfg
+		makeUpstreamRequestFunc = oldMakeUpstreamRequest
+	})
+
+	attempts := 0
+	makeUpstreamRequestFunc = func(ctx context.Context, token string, messages []Message, model string, stream bool, imageURLs, videoURLs []string, hasTools bool) (*fhttp.Response, string, error) {
+		attempts++
+		return &fhttp.Response{
+			StatusCode: http.StatusMethodNotAllowed,
+			Header: fhttp.Header{
+				"Content-Type": []string{"text/html; charset=utf-8"},
+			},
+			Body: io.NopCloser(bytes.NewBufferString(`<!doctypehtml><html><head><title>405</title></head><body>errors.aliyun.com</body></html>`)),
+		}, "GLM-5.1", nil
+	}
+
+	body := map[string]interface{}{
+		"model": "GLM-5.1",
+		"messages": []map[string]string{
+			{"role": "user", "content": "hello"},
+		},
+		"stream": false,
+	}
+	payload, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer admin-key")
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	HandleChatCompletions(rec, req)
+
+	if attempts != 1 {
+		t.Fatalf("expected exactly one upstream attempt, got %d", attempts)
+	}
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("upstream_edge_blocked")) {
+		t.Fatalf("expected upstream_edge_blocked code, got %s", rec.Body.String())
+	}
+}
+
 func TestHandleChatCompletionsStopsWhenRequestContextCanceled(t *testing.T) {
 	initChatRetryTests(t)
 	setupChatRetryTokenManager()
