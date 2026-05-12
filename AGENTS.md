@@ -12,6 +12,7 @@
   - `GET /`
   - `GET /console`
   - `GET /v1/models`
+  - `GET/PUT/PATCH /v1/config`
   - `GET/POST/PUT/DELETE /v1/tokens`
   - `POST /v1/chat/completions`
 - 兼容流式和非流式聊天补全返回
@@ -20,7 +21,7 @@
 - 支持工具调用适配：把 OpenAI tools 注入为提示协议，再将模型输出提取回 OpenAI `tool_calls`
 - 支持图片/视频输入：先上传到 z.ai 文件接口，再把文件 ID 回填到上游消息
 - 支持基于 SQLite token ledger 的 token 管理 API，并通过 `/api/v1/auths/` 滚动刷新 z.ai bearer
-- 提供精简 `/console` 控制台，展示调用统计、成功/失败数量、模型统计和 token ledger 管理
+- 提供精简 `/console` 控制台，展示调用统计、成功/失败数量、模型统计、运行时代理配置和 token ledger 管理
 - 维护遥测、日志、请求重试和基础服务状态输出
 
 ## 技术栈
@@ -40,7 +41,7 @@
 - `cmd/main.go`
   - 服务入口
   - 初始化配置、日志、上游 token 管理、前端版本同步、模型同步
-  - 注册 `/`、`/console`、`/v1/models`、`/v1/tokens`、`/v1/chat/completions`
+  - 注册 `/`、`/console`、`/v1/models`、`/v1/config`、`/v1/tokens`、`/v1/chat/completions`
 - `internal/console.go`
   - 返回无构建步骤的控制台单页 HTML
   - 页面复用 `/` 遥测数据和 `/v1/tokens` 受保护 CRUD API
@@ -70,7 +71,9 @@
 - `internal/version.go`
   - 抓取 z.ai 前端版本，给上游请求补 `X-FE-Version`
 - `internal/config.go`
-  - `.env` 配置加载
+  - `.env` 配置加载和 `data/runtime_config.json` 运行时覆盖
+- `internal/config_api.go`
+  - 受保护的在线配置 API，当前用于即时切换 `UPSTREAM_PROXY`
 - `internal/token_manager.go`
   - 上游 token 加载、校验、轮询和统计
 - `internal/token_store.go`
@@ -82,7 +85,7 @@
 
 服务启动入口在 `cmd/main.go`，顺序是：
 
-1. `LoadConfig()` 读取 `.env`
+1. `LoadConfig()` 读取 `.env`，再加载 `RUNTIME_CONFIG_PATH` 中的运行时覆盖
 2. `InitLogger()` 初始化日志
 3. `GetTokenManager().Start()` 启动上游 token 管理器
 4. `StartVersionUpdater()` 定时抓取 z.ai 前端版本号
@@ -203,6 +206,7 @@
 `GET /console` 返回内置单页控制台，不需要额外前端构建。它只复用现有后端状态源：
 
 - `/`：服务状态、总调用数、成功/失败调用数、成功率、RPM、token 用量、模型维度统计
+- `/v1/config`：受保护的运行时配置读取与更新，代理密码只返回遮罩预览
 - `/v1/tokens?status=all`：SQLite token ledger 的列表、批量新增、状态变更和删除
 
 控制台页面本身公开可访问，但 token 管理请求仍走 `AUTH_TOKEN` / `SKIP_AUTH_TOKEN` 规则。页面中的 `AUTH_TOKEN` 默认保存在当前浏览器 `sessionStorage`，只有用户勾选 remember this browser 才写入 `localStorage`。
@@ -267,6 +271,7 @@ Z.ai bearer 被当作可滚动续签的会话凭证处理：
 - `AUTH_TOKEN`
 - `BACKUP_TOKEN`
 - `TOKEN_DB_PATH`
+- `RUNTIME_CONFIG_PATH`
 - `TOKEN_API_ALLOW_REVEAL`
 - `DEBUG_LOGGING`
 - `TOOL_SUPPORT`
@@ -314,7 +319,7 @@ Z.ai bearer 被当作可滚动续签的会话凭证处理：
    - thinking/search 后缀行为
 6. 改媒体逻辑时，不要只改消息解析；上传接口、`files` 结构和回填映射必须一起验证
 7. 改上游请求头或 TLS 逻辑时，`X-FE-Version`、最小 header 契约和 `TLSHTTPClient()` 需要一起看，不能只改单点
-8. 改控制台时，不要新增独立状态源；优先复用 `/` 遥测和 `/v1/tokens`，并保持 token 本体在页面上遮罩显示
+8. 改控制台时，不要新增独立状态源；优先复用 `/` 遥测、`/v1/config` 和 `/v1/tokens`，并保持 token 本体和代理密码在页面上遮罩显示
 
 ## 构建与验证
 

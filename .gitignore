@@ -39,6 +39,7 @@ main
 /data/*.sqlite
 /data/*.sqlite-*
 /data/backups/
+/data/runtime_config.json
 
 # Test files
 test.txt
@@ -55,3 +56,4 @@ debug/
 *.tmp
 *.temp
 .ace-tool/
+.playwright-mcp/

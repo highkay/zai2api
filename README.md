@@ -8,7 +8,7 @@
 ## 功能特性
 
 - **OpenAI 兼容 API** - 支持 `/v1/chat/completions`、`/v1/models` 和 `/v1/tokens`
-- **轻量控制台** - 提供 `/console` 查看调用统计、模型统计和管理上游 token
+- **轻量控制台** - 提供 `/console` 查看调用统计、模型统计、运行时代理配置和管理上游 token
 - **多模型支持** - 内置常用模型别名，并自动从云端同步最新模型列表
 - **流式响应** - 支持 SSE 流式输出
 - **工具调用** - 支持 Function Calling
@@ -71,15 +71,16 @@ AUTH_TOKEN=your-api-key
 
 服务将在 `http://localhost:8000` 启动。
 
-控制台地址是 `http://localhost:8000/console`。页面本身不需要额外构建；Token 管理操作会要求输入 `.env` 中配置的 `AUTH_TOKEN`。
+控制台地址是 `http://localhost:8000/console`。页面本身不需要额外构建；运行时配置和 Token 管理操作会要求输入 `.env` 中配置的 `AUTH_TOKEN`。
 
 ## API 端点
 
 | 端点 | 方法 | 描述 |
 |------|------|------|
 | `/` | GET | 服务状态和遥测数据 |
-| `/console` | GET | 精简控制台，查看调用统计并管理上游 token |
+| `/console` | GET | 精简控制台，查看调用统计、运行时配置并管理上游 token |
 | `/v1/models` | GET | 获取可用模型列表 |
+| `/v1/config` | `GET` / `PUT` / `PATCH` | 查看和更新在线运行时配置 |
 | `/v1/tokens` | `GET` / `POST` / `PUT` / `DELETE` | 管理 SQLite token ledger 中的上游 token |
 | `/v1/chat/completions` | POST | 聊天补全接口 |
 
@@ -92,6 +93,7 @@ AUTH_TOKEN=your-api-key
 | `AUTH_TOKEN` | - | API 认证令牌（支持多个，逗号分隔） |
 | `BACKUP_TOKEN` | - | 备用上游令牌（支持多个，逗号分隔） |
 | `TOKEN_DB_PATH` | `data/tokens.db` | SQLite token ledger 路径 |
+| `RUNTIME_CONFIG_PATH` | `data/runtime_config.json` | `/v1/config` 持久化在线运行时配置的文件路径 |
 | `TOKEN_API_ALLOW_REVEAL` | false | 是否允许 `GET /v1/tokens?reveal=true` 返回完整 bearer |
 | `DEBUG_LOGGING` | false | 调试日志 |
 | `TOOL_SUPPORT` | true | 工具调用支持 |
@@ -151,6 +153,35 @@ curl "http://localhost:8000/v1/tokens?id=1" \
   -H "Authorization: Bearer your-api-key"
 ```
 
+### 在线配置 API
+
+查看当前运行时配置。代理地址只返回遮罩预览，不回传完整密码：
+
+```bash
+curl http://localhost:8000/v1/config \
+  -H "Authorization: Bearer your-api-key"
+```
+
+在线更新上游出口代理，立即影响新的上游请求，并写入 `RUNTIME_CONFIG_PATH`：
+
+```bash
+curl http://localhost:8000/v1/config \
+  -X PUT \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"upstream_proxy":"http://user:password@host:port"}'
+```
+
+清空代理改为直连：
+
+```bash
+curl http://localhost:8000/v1/config \
+  -X PUT \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"upstream_proxy":""}'
+```
+
 ## 上游 Token 规则
 
 - 主上游 token 池来自 SQLite token ledger，默认文件是 `data/tokens.db`。
@@ -168,6 +199,7 @@ curl "http://localhost:8000/v1/tokens?id=1" \
 `/console` 是一个无前端构建步骤的单页控制台，直接由 Go 服务返回。
 
 - 统计区读取 `/` 的遥测数据，展示总调用、成功调用、失败调用、成功率、RPM、Token 用量和模型维度统计。
+- 运行时配置区使用 `/v1/config`，可在线切换 `UPSTREAM_PROXY`，代理密码只显示遮罩预览。
 - Token 区使用 `/v1/tokens?status=all`，展示 active、invalid、disabled、rotated、source、使用次数、刷新时间和失效原因。
 - 默认只展示 `token_preview`，不会从 API 拉取完整 bearer；只有 `TOKEN_API_ALLOW_REVEAL=true` 且请求显式 `reveal=true` 时才会返回完整 token。
 - `AUTH_TOKEN` 默认只保存在当前浏览器的 `sessionStorage`；勾选 remember this browser 后才会写入 `localStorage`。

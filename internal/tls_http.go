@@ -32,10 +32,7 @@ func TLSHTTPClient(timeout time.Duration) (tls_client.HttpClient, error) {
 	if sec < 1 {
 		sec = 1
 	}
-	proxyURL := ""
-	if Cfg != nil {
-		proxyURL = Cfg.UpstreamProxy
-	}
+	proxyURL := GetUpstreamProxy()
 	key := tlsClientCacheKey{timeoutSeconds: sec, proxyURL: proxyURL}
 	tlsClientMu.Lock()
 	defer tlsClientMu.Unlock()

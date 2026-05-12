@@ -170,6 +170,19 @@ const consoleHTML = `<!doctype html>
 
       <div class="panel span-12">
         <div class="section-head">
+          <h2 class="section-title">Runtime Config</h2>
+          <div id="config-current" class="hint">locked</div>
+        </div>
+        <div class="filters">
+          <input id="upstream-proxy" type="password" autocomplete="off" placeholder="upstream proxy URL">
+          <button id="save-config" type="button" class="good">Save Proxy</button>
+          <button id="clear-proxy" type="button" class="secondary">Direct</button>
+        </div>
+        <div id="config-status" class="hint"></div>
+      </div>
+
+      <div class="panel span-12">
+        <div class="section-head">
           <h2 class="section-title">Token Ledger</h2>
           <div class="actions">
             <button id="reload" class="secondary" type="button">Refresh</button>
@@ -228,6 +241,7 @@ const consoleHTML = `<!doctype html>
     const storageKey = "zai2api_console_key";
     const state = {
       key: sessionStorage.getItem(storageKey) || localStorage.getItem(storageKey) || "",
+      config: null,
       tokens: []
     };
     const $ = (id) => document.getElementById(id);
@@ -239,6 +253,11 @@ const consoleHTML = `<!doctype html>
     $("reload").addEventListener("click", loadAll);
     $("clear-tokens").addEventListener("click", () => { $("new-tokens").value = ""; });
     $("add-tokens").addEventListener("click", addTokens);
+    $("save-config").addEventListener("click", saveConfig);
+    $("clear-proxy").addEventListener("click", () => {
+      $("upstream-proxy").value = "";
+      saveConfig();
+    });
     $("status-filter").addEventListener("change", loadTokens);
     $("source-filter").addEventListener("change", loadTokens);
 
@@ -277,7 +296,11 @@ const consoleHTML = `<!doctype html>
       $("auth-banner").classList.toggle("hidden", hasKey);
       $("add-tokens").disabled = !hasKey;
       $("new-tokens").disabled = !hasKey;
+      $("save-config").disabled = !hasKey;
+      $("clear-proxy").disabled = !hasKey;
+      $("upstream-proxy").disabled = !hasKey;
       $("mutation-status").textContent = hasKey ? "" : "AUTH_TOKEN required before mutating tokens";
+      $("config-status").textContent = hasKey ? "" : "AUTH_TOKEN required before updating runtime config";
     }
     async function requestJSON(url, options = {}) {
       const response = await fetch(url, options);
@@ -306,6 +329,49 @@ const consoleHTML = `<!doctype html>
       $("uptime").textContent = "uptime " + (t.uptime || "0s");
       $("token-usage").textContent = number(Number(t.total_input_tokens || 0) + Number(t.total_output_tokens || 0));
       renderModels(t.model_stats || {});
+    }
+
+    async function loadConfig() {
+      if (!state.key) {
+        renderConfig(null);
+        return;
+      }
+      const payload = await requestJSON("/v1/config", { headers: authHeaders() });
+      state.config = payload.data || null;
+      renderConfig(state.config);
+    }
+
+    function renderConfig(config) {
+      if (!config) {
+        $("config-current").textContent = "locked";
+        return;
+      }
+      const proxy = config.upstream_proxy_set ? config.upstream_proxy_preview : "direct";
+      $("config-current").textContent = "proxy " + proxy;
+      $("config-status").textContent = "runtime file " + (config.runtime_config_path || "-");
+    }
+
+    async function saveConfig() {
+      if (!state.key) {
+        $("config-status").textContent = "AUTH_TOKEN required";
+        return;
+      }
+      $("save-config").disabled = true;
+      try {
+        const payload = await requestJSON("/v1/config", {
+          method: "PUT",
+          headers: { ...authHeaders(), "Content-Type": "application/json" },
+          body: JSON.stringify({ upstream_proxy: $("upstream-proxy").value.trim() })
+        });
+        state.config = payload.data || null;
+        $("upstream-proxy").value = "";
+        renderConfig(state.config);
+        $("config-status").textContent = payload.message || "config updated";
+      } catch (err) {
+        $("config-status").textContent = err.message;
+      } finally {
+        $("save-config").disabled = false;
+      }
     }
 
     function renderModels(stats) {
@@ -477,6 +543,12 @@ const consoleHTML = `<!doctype html>
         await loadTelemetry();
       } catch (err) {
         $("health-text").textContent = err.message;
+      }
+      try {
+        await loadConfig();
+      } catch (err) {
+        $("config-status").textContent = err.message;
+        renderConfig(null);
       }
       try {
         await loadTokens();

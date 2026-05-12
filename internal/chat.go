@@ -51,8 +51,8 @@ const (
 const defaultChatAPIEndpoint = "https://chat.z.ai/api/v2/chat/completions"
 
 func chatAPIEndpoint() string {
-	if Cfg != nil && strings.TrimSpace(Cfg.APIEndpoint) != "" {
-		return Cfg.APIEndpoint
+	if endpoint := strings.TrimSpace(GetAPIEndpoint()); endpoint != "" {
+		return endpoint
 	}
 	return defaultChatAPIEndpoint
 }

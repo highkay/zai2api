@@ -11,7 +11,7 @@ import (
 func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.Header().Set("Access-Control-Allow-Credentials", "true")
 
@@ -102,6 +102,7 @@ func main() {
 	http.HandleFunc("/console", corsMiddleware(loggingMiddleware(internal.HandleConsole)))
 	http.HandleFunc("/console/", corsMiddleware(loggingMiddleware(internal.HandleConsole)))
 	http.HandleFunc("/v1/models", corsMiddleware(loggingMiddleware(internal.HandleModels)))
+	http.HandleFunc("/v1/config", corsMiddleware(loggingMiddleware(internal.HandleConfig)))
 	http.HandleFunc("/v1/tokens", corsMiddleware(loggingMiddleware(internal.HandleTokens)))
 	http.HandleFunc("/v1/chat/completions", corsMiddleware(loggingMiddleware(internal.HandleChatCompletions)))
 	addr := ":" + internal.Cfg.Port
