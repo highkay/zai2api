@@ -12,3 +12,14 @@ services:
     volumes:
       - ./data:/app/data
     restart: unless-stopped
+  browser-helper:
+    build:
+      context: .
+      dockerfile: browser_helper/Dockerfile
+    env_file:
+      - .env
+    ports:
+      - "${BROWSER_HELPER_PORT:-39090}:39090"
+    ipc: host
+    init: true
+    restart: unless-stopped

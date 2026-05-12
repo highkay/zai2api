@@ -2,6 +2,10 @@
 .github
 .vscode
 .idea
+.tmp
+.pyc
+__pycache__
+.ace-tool
 data
 dist
 build

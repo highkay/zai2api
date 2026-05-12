@@ -9,13 +9,20 @@ import (
 )
 
 type configUpdateRequest struct {
-	UpstreamProxy *string `json:"upstream_proxy"`
+	ChatBackend      *string `json:"chat_backend"`
+	UpstreamProxy    *string `json:"upstream_proxy"`
+	BrowserHelperURL *string `json:"browser_helper_url"`
 }
 
 type publicConfig struct {
 	APIEndpoint          string `json:"api_endpoint"`
+	ChatBackend          string `json:"chat_backend"`
 	UpstreamProxySet     bool   `json:"upstream_proxy_set"`
 	UpstreamProxyPreview string `json:"upstream_proxy_preview"`
+	BrowserHelperURLSet  bool   `json:"browser_helper_url_set"`
+	BrowserHelperURL     string `json:"browser_helper_url"`
+	BrowserHelperAuthSet bool   `json:"browser_helper_auth_set"`
+	BrowserHelperReady   bool   `json:"browser_helper_ready"`
 	RuntimeConfigPath    string `json:"runtime_config_path"`
 }
 
@@ -48,12 +55,16 @@ func handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		writeInvalidRequestError(w, "Invalid JSON body")
 		return
 	}
-	if req.UpstreamProxy == nil {
-		writeInvalidRequestError(w, "upstream_proxy is required")
+	if req.ChatBackend == nil && req.UpstreamProxy == nil && req.BrowserHelperURL == nil {
+		writeInvalidRequestError(w, "at least one runtime config field is required")
 		return
 	}
 
-	snapshot, err := UpdateRuntimeConfig(RuntimeConfigUpdate{UpstreamProxy: req.UpstreamProxy})
+	snapshot, err := UpdateRuntimeConfig(RuntimeConfigUpdate{
+		ChatBackend:      req.ChatBackend,
+		UpstreamProxy:    req.UpstreamProxy,
+		BrowserHelperURL: req.BrowserHelperURL,
+	})
 	if err != nil {
 		writeInvalidRequestError(w, err.Error())
 		return
@@ -67,8 +78,13 @@ func writeConfigResponse(w http.ResponseWriter, status int, message string, snap
 		Message: message,
 		Data: publicConfig{
 			APIEndpoint:          snapshot.APIEndpoint,
+			ChatBackend:          snapshot.ChatBackend,
 			UpstreamProxySet:     strings.TrimSpace(snapshot.UpstreamProxy) != "",
 			UpstreamProxyPreview: maskProxyURL(snapshot.UpstreamProxy),
+			BrowserHelperURLSet:  strings.TrimSpace(snapshot.BrowserHelperURL) != "",
+			BrowserHelperURL:     snapshot.BrowserHelperURL,
+			BrowserHelperAuthSet: snapshot.BrowserHelperAuth,
+			BrowserHelperReady:   snapshot.BrowserHelperReady,
 			RuntimeConfigPath:    snapshot.RuntimeConfigPath,
 		},
 	})

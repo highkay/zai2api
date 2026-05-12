@@ -2,7 +2,6 @@ package internal
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -100,6 +99,8 @@ func writeUpstreamError(w http.ResponseWriter, statusCode int, upstreamBody []by
 	}
 
 	message := "请求失败"
+	errType := ErrTypeUpstream
+	code := "upstream_error"
 	if err := json.Unmarshal(upstreamBody, &upstreamErr); err == nil {
 		if upstreamErr.Error.Message != "" {
 			message = upstreamErr.Error.Message
@@ -108,9 +109,15 @@ func writeUpstreamError(w http.ResponseWriter, statusCode int, upstreamBody []by
 		} else if upstreamErr.Msg != "" {
 			message = upstreamErr.Msg
 		}
+		if upstreamErr.Error.Type != "" {
+			errType = upstreamErr.Error.Type
+		}
+		if upstreamErr.Error.Code != "" {
+			code = upstreamErr.Error.Code
+		}
 	}
 
-	writeError(w, statusCode, ErrTypeUpstream, message, "upstream_error")
+	writeError(w, statusCode, errType, message, code)
 }
 
 func isUpstreamEdgeBlockedResponse(statusCode int, contentType string, body []byte) bool {
@@ -147,38 +154,14 @@ func extractAllMediaURLs(messages []Message) (imageURLs, videoURLs []string) {
 var makeUpstreamRequestFunc = makeUpstreamRequest
 
 func makeUpstreamRequest(ctx context.Context, token string, messages []Message, model string, stream bool, imageURLs, videoURLs []string, hasTools bool) (*fhttp.Response, string, error) {
-	if ctx == nil {
-		ctx = context.Background()
+	switch strings.ToLower(strings.TrimSpace(GetChatBackend())) {
+	case "", "direct":
+		return makeDirectUpstreamRequest(ctx, token, messages, model, stream, imageURLs, videoURLs, hasTools)
+	case "browser_helper":
+		return makeBrowserHelperUpstreamRequest(ctx, token, messages, model, stream, imageURLs, videoURLs, hasTools)
+	default:
+		return nil, "", fmt.Errorf("unsupported chat backend: %s", GetChatBackend())
 	}
-	requestCtx, cancel := deriveCancelableRequestContext(ctx)
-
-	req, targetModel, err := buildUpstreamChatRequest(requestCtx, token, messages, model, stream, imageURLs, videoURLs, hasTools)
-	if err != nil {
-		cancel()
-		return nil, "", err
-	}
-
-	client, err := TLSHTTPClient(300 * time.Second)
-	if err != nil {
-		cancel()
-		return nil, "", err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		cancel()
-		return nil, "", err
-	}
-	if resp.Body != nil {
-		resp.Body = &cancelOnCloseReadCloser{
-			ReadCloser: resp.Body,
-			cancel:     cancel,
-		}
-	} else {
-		cancel()
-	}
-
-	LogDebug("Upstream response: status=%d", resp.StatusCode)
-	return resp, targetModel, nil
 }
 
 type cancelOnCloseReadCloser struct {
@@ -192,172 +175,6 @@ func (r *cancelOnCloseReadCloser) Close() error {
 		r.cancel()
 	}
 	return err
-}
-
-func buildUpstreamChatRequest(ctx context.Context, token string, messages []Message, model string, stream bool, imageURLs, videoURLs []string, hasTools bool) (*fhttp.Request, string, error) {
-	if strings.TrimSpace(token) == "" {
-		return nil, "", fmt.Errorf("empty upstream token")
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	userMsgID := uuid.New().String()
-
-	// 使用新的模型映射系统
-	mapping := GetUpstreamConfig(model)
-	var targetModel string
-	var enableThinking, autoWebSearch bool
-	var mcpServers []string
-
-	if mapping != nil {
-		targetModel = mapping.UpstreamModelID
-		enableThinking = mapping.EnableThinking
-		autoWebSearch = mapping.AutoWebSearch
-		mcpServers = mapping.MCPServers
-		LogDebug("Model mapping: %s -> %s (thinking=%v, search=%v)", model, targetModel, enableThinking, autoWebSearch)
-	} else {
-		// 回退到老的逻辑
-		targetModel = GetTargetModel(model)
-		enableThinking = IsThinkingModel(model)
-		autoWebSearch = IsSearchModel(model)
-		LogDebug("Using fallback model mapping: %s -> %s", model, targetModel)
-	}
-
-	if isVisionModelID(strings.ToLower(targetModel)) {
-		autoWebSearch = false
-	}
-
-	if hasTools {
-		autoWebSearch = false
-		LogDebug("[Upstream] Disabled auto web search because custom tools were provided")
-	}
-	if len(imageURLs) > 0 || len(videoURLs) > 0 {
-		vlmServers := []string{"vlm-image-search", "vlm-image-recognition", "vlm-image-processing"}
-		existingSet := make(map[string]bool)
-		for _, s := range mcpServers {
-			existingSet[s] = true
-		}
-		for _, s := range vlmServers {
-			if !existingSet[s] {
-				mcpServers = append(mcpServers, s)
-			}
-		}
-	}
-
-	latestUserContent := extractLatestUserContent(messages)
-
-	urlToFileID := make(map[string]string)
-	var filesData []map[string]interface{}
-
-	// 上传图片
-	if len(imageURLs) > 0 {
-		LogDebug("[Upstream] Uploading %d images...", len(imageURLs))
-		imageFiles, err := UploadImages(ctx, token, imageURLs)
-		if err != nil {
-			return nil, "", err
-		}
-		LogDebug("[Upstream] Image upload result: %d files", len(imageFiles))
-		for i, f := range imageFiles {
-			if i < len(imageURLs) {
-				urlToFileID[imageURLs[i]] = f.ID
-			}
-			filesData = append(filesData, map[string]interface{}{
-				"type":            f.Type,
-				"file":            f.File,
-				"id":              f.ID,
-				"url":             f.URL,
-				"name":            f.Name,
-				"status":          f.Status,
-				"size":            f.Size,
-				"error":           f.Error,
-				"itemId":          f.ItemID,
-				"media":           f.Media,
-				"ref_user_msg_id": userMsgID,
-			})
-		}
-	}
-
-	// 上传视频
-	if len(videoURLs) > 0 {
-		LogDebug("[Upstream] Uploading %d videos...", len(videoURLs))
-		videoFiles, err := UploadVideos(ctx, token, videoURLs)
-		if err != nil {
-			return nil, "", err
-		}
-		LogDebug("[Upstream] Video upload result: %d files", len(videoFiles))
-		for i, f := range videoFiles {
-			if i < len(videoURLs) {
-				urlToFileID[videoURLs[i]] = f.ID
-			}
-			filesData = append(filesData, map[string]interface{}{
-				"type":            f.Type,
-				"file":            f.File,
-				"id":              f.ID,
-				"url":             f.URL,
-				"name":            f.Name,
-				"status":          f.Status,
-				"size":            f.Size,
-				"error":           f.Error,
-				"itemId":          f.ItemID,
-				"media":           f.Media,
-				"ref_user_msg_id": userMsgID,
-			})
-		}
-	}
-	var upstreamMessages []map[string]interface{}
-	for _, msg := range messages {
-		upstreamMessages = append(upstreamMessages, msg.ToUpstreamMessage(urlToFileID))
-	}
-
-	body := map[string]interface{}{
-		"stream":   stream,
-		"model":    targetModel,
-		"messages": upstreamMessages,
-	}
-
-	features := make(map[string]interface{})
-	if enableThinking {
-		features["enable_thinking"] = true
-	}
-	if autoWebSearch && !hasTools {
-		features["web_search"] = true
-		features["auto_web_search"] = true
-	}
-	if len(imageURLs) > 0 || len(videoURLs) > 0 {
-		features["image_generation"] = true
-	}
-	if len(features) > 0 {
-		body["features"] = features
-	}
-
-	if len(mcpServers) > 0 {
-		body["mcp_servers"] = mcpServers
-	}
-
-	if len(filesData) > 0 {
-		body["files"] = filesData
-		body["current_user_message_id"] = userMsgID
-		LogDebug("[Upstream] Attaching %d files to request, userMsgID=%s", len(filesData), userMsgID)
-		for i, fd := range filesData {
-			LogDebug("[Upstream] File %d: id=%v, type=%v, name=%v, status=%v", i+1, fd["id"], fd["type"], fd["name"], fd["status"])
-		}
-	}
-
-	bodyBytes, _ := json.Marshal(body)
-
-	req, err := fhttp.NewRequestWithContext(ctx, "POST", chatAPIEndpoint(), bytes.NewReader(bodyBytes))
-	if err != nil {
-		return nil, "", err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("X-FE-Version", GetFeVersion())
-	req.Header.Set("Content-Type", "application/json")
-
-	LogDebug("Upstream request: model=%s, messages=%d, stream=%v, fe=%s, prompt_len=%d, files=%d",
-		targetModel, len(messages), stream, GetFeVersion(), len(latestUserContent), len(filesData))
-	return req, targetModel, nil
 }
 
 type UpstreamData struct {

@@ -105,3 +105,46 @@ func TestHandleConfigRejectsInvalidProxy(t *testing.T) {
 		t.Fatalf("expected bad request, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestHandleConfigUpdatesBrowserHelperSettings(t *testing.T) {
+	oldCfg := Cfg
+	tempDir := t.TempDir()
+	Cfg = &Config{
+		APIEndpoint:       "https://chat.z.ai/api/v2/chat/completions",
+		AuthTokens:        []string{"admin-key"},
+		RuntimeConfigPath: filepath.Join(tempDir, "runtime_config.json"),
+	}
+	t.Cleanup(func() {
+		Cfg = oldCfg
+	})
+
+	payload, _ := json.Marshal(map[string]string{
+		"chat_backend":       "browser_helper",
+		"browser_helper_url": "http://host.docker.internal:39090/v1/browser-chat/completions",
+	})
+	req := httptest.NewRequest(http.MethodPut, "/v1/config", bytes.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer admin-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	HandleConfig(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if Cfg.ChatBackend != "browser_helper" {
+		t.Fatalf("expected browser_helper backend, got %q", Cfg.ChatBackend)
+	}
+	if Cfg.BrowserHelperURL != "http://host.docker.internal:39090/v1/browser-chat/completions" {
+		t.Fatalf("unexpected browser helper URL: %q", Cfg.BrowserHelperURL)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"chat_backend":"browser_helper"`) {
+		t.Fatalf("response missing browser_helper backend: %s", body)
+	}
+	if !strings.Contains(body, `"browser_helper_url_set":true`) {
+		t.Fatalf("response missing browser helper URL flag: %s", body)
+	}
+	if !strings.Contains(body, `"browser_helper_ready":true`) {
+		t.Fatalf("response missing browser helper ready flag: %s", body)
+	}
+}

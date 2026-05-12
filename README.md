@@ -15,6 +15,7 @@
 - **多模态** - 支持图片输入
 - **思考模式** - 支持 Thinking 模型的思考过程处理
 - **Token 管理** - 使用 SQLite token ledger 自动刷新、轮换、隔离和审计上游 Token
+- **可切换聊天后端** - 默认 direct HTTP，可选转发到外部 browser helper 做 page-backed chat
 - **遥测统计** - 请求计数、Token 统计、成功/失败数量、成功率等
 
 ## 快速开始
@@ -90,6 +91,10 @@ AUTH_TOKEN=your-api-key
 |--------|--------|------|
 | `PORT` | 8000 | 服务端口 |
 | `UPSTREAM_PROXY` | - | 上游 z.ai 请求使用的出口代理，支持 `http://`、`https://`、`socks5://`、`socks5h://` |
+| `CHAT_BACKEND` | `direct` | 聊天后端：`direct` 或 `browser_helper` |
+| `BROWSER_HELPER_URL` | - | 外部 browser helper HTTP 地址；当 `CHAT_BACKEND=browser_helper` 时启用 |
+| `BROWSER_HELPER_AUTH_TOKEN` | - | browser helper 的内部 Bearer 鉴权令牌（可选） |
+| `BROWSER_HELPER_TIMEOUT_SECONDS` | `180` | browser helper 请求超时 |
 | `AUTH_TOKEN` | - | API 认证令牌（支持多个，逗号分隔） |
 | `BACKUP_TOKEN` | - | 备用上游令牌（支持多个，逗号分隔） |
 | `TOKEN_DB_PATH` | `data/tokens.db` | SQLite token ledger 路径 |
@@ -182,6 +187,19 @@ curl http://localhost:8000/v1/config \
   -d '{"upstream_proxy":""}'
 ```
 
+切换到 browser helper 后端，并指定 helper 地址：
+
+```bash
+curl http://localhost:8000/v1/config \
+  -X PUT \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chat_backend":"browser_helper",
+    "browser_helper_url":"http://host.docker.internal:39090/v1/browser-chat/completions"
+  }'
+```
+
 ## 上游 Token 规则
 
 - 主上游 token 池来自 SQLite token ledger，默认文件是 `data/tokens.db`。
@@ -244,6 +262,7 @@ print(response.choices[0].message.content)
 - 如果部署机器直连 `chat.z.ai` 被边缘网络拦截，可设置 `UPSTREAM_PROXY` 让刷新 token、模型同步、文件上传和聊天请求统一走同一个出口。
 - `405 text/html` 通常是出口/IP/边缘路由拦截，不是 z.ai chat 应用层验证码；只有 `200 text/event-stream` 内的 `FRONTEND_CAPTCHA_REQUIRED` 才进入 captcha 问题域。
 - 使用本仓库 Docker Compose 时，如果代理在宿主机上，可设置 `UPSTREAM_PROXY=http://host.docker.internal:7890`。
+- 如果要走 page-backed chat，推荐把 browser helper 部署在宿主机，用 `host.docker.internal` 暴露给容器；这样浏览器、Python 和 Chrome 不必塞进当前主代理镜像。
 - 即使上游请求体 `stream=false`，z.ai 当前仍返回 `text/event-stream`，所以非流式路径也按 SSE 汇总后再输出 OpenAI JSON。
 
 ## 项目结构
