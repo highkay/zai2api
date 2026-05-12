@@ -190,6 +190,7 @@ curl http://localhost:8000/v1/config \
 - `/v1/tokens` 默认返回 `active`、`invalid`、`disabled` 等状态记录，但不会回传完整 bearer。
 - Token 刷新使用 z.ai Web 侧滚动会话机制：`GET https://chat.z.ai/api/v1/auths/` 返回新 token 后会写入 SQLite，并自动物理删除旧 token。
 - 聊天调用前会尽量先刷新一次上游 token；如果刷新遇到临时网络失败，会继续使用仍处于 active 状态的旧 token。
+- 如果聊天 SSE 返回 `Please refresh the page to update the app`，代理会重新抓取 `X-FE-Version` 并强制续签 bearer 后再重放请求。
 - 临时网络失败只更新检查时间，不删除 token；只有上游明确返回 `401/403` 时才会判定 token 失效并标为 `invalid`。
 - 当前版本没有匿名 token 获取，也没有自动注册链路。
 - 当没有任何上游 token 可用时，`/v1/chat/completions` 会返回 `503`。

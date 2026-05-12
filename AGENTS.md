@@ -220,8 +220,9 @@ Z.ai bearer 被当作可滚动续签的会话凭证处理：
 3. `BACKUP_TOKEN` 会导入为 `env_backup` 来源的管理副本，后续刷新结果写入 SQLite。
 4. 定时或鉴权失败时调用 `GET https://chat.z.ai/api/v1/auths/`。
 5. 如果返回新 token，就写入新的 active 记录，并自动物理删除旧 token。
-6. 临时网络失败只记录检查时间和日志，不删除 token。
-7. 只有明确的 `401/403` 会把 token 标为 `invalid` 并移出内存轮询池。
+6. 如果聊天 SSE 返回 `Please refresh the page to update the app`，代理会重新抓取 `X-FE-Version` 并强制续签 bearer 后再重放请求。
+7. 临时网络失败只记录检查时间和日志，不删除 token。
+8. 只有明确的 `401/403` 会把 token 标为 `invalid` 并移出内存轮询池。
 
 ## 工具调用实现方式
 

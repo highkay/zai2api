@@ -462,6 +462,37 @@ func classifyNonRetryableUpstreamError(errorCode, errorMessage string) (statusCo
 	}
 }
 
+func shouldRefreshChatSessionForUpstreamError(errorCode, errorMessage string) bool {
+	normalizedCode := strings.ToUpper(strings.TrimSpace(errorCode))
+	normalizedMessage := strings.ToLower(strings.TrimSpace(errorMessage))
+
+	switch normalizedCode {
+	case "401", "403", "UNAUTHORIZED", "FORBIDDEN", "AUTH_EXPIRED", "TOKEN_EXPIRED":
+		return true
+	}
+
+	return strings.Contains(normalizedMessage, "refresh the page to update the app")
+}
+
+func refreshChatSessionForRetry(token, reason string) (string, bool) {
+	retry := false
+	if version, changed := RefreshFeVersion(); changed {
+		LogWarn("%s, refreshed fe version to %s", reason, version)
+		retry = true
+	}
+
+	refreshOutcome := GetTokenManager().RefreshToken(token, true)
+	if refreshOutcome.Valid && refreshOutcome.Token != "" && refreshOutcome.Token != token {
+		LogWarn("%s, refreshed token and retrying", reason)
+		return refreshOutcome.Token, true
+	}
+	if altToken := GetTokenManager().GetAlternativeToken(token); altToken != "" {
+		LogWarn("%s, retrying with alternative token", reason)
+		return altToken, true
+	}
+	return token, retry
+}
+
 func (u *UpstreamData) GetEditContent() string {
 	editContent := u.Data.EditContent
 	if editContent == "" {
@@ -681,15 +712,8 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			LogError("Upstream error (attempt %d): status=%d, body=%s", attempt+1, resp.StatusCode, string(body)[:min(500, len(body))])
 			lastError = fmt.Sprintf("status %d", resp.StatusCode)
 			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-				refreshOutcome := GetTokenManager().RefreshToken(token, true)
-				if refreshOutcome.Valid && refreshOutcome.Refreshed && refreshOutcome.Token != "" && refreshOutcome.Token != token {
-					token = refreshOutcome.Token
-					LogWarn("Upstream auth failed, refreshed token and retrying")
-					continue
-				}
-				if altToken := GetTokenManager().GetAlternativeToken(token); altToken != "" {
-					token = altToken
-					LogWarn("Upstream auth failed, retrying with alternative token")
+				if newToken, ok := refreshChatSessionForRetry(token, "Upstream auth failed"); ok {
+					token = newToken
 					continue
 				}
 			}
@@ -723,6 +747,14 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				writeError(w, statusCode, ErrTypeUpstream, result.ErrorMessage, responseCode)
 			}
 			return
+		}
+
+		if shouldRefreshChatSessionForUpstreamError(result.ErrorCode, result.ErrorMessage) && !result.ResponseStarted {
+			if newToken, ok := refreshChatSessionForRetry(token, "Upstream session refresh required"); ok {
+				token = newToken
+				lastError = result.ErrorMessage
+				continue
+			}
 		}
 
 		// 检查是否需要重试
