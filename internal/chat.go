@@ -139,24 +139,47 @@ func makeUpstreamRequest(ctx context.Context, token string, messages []Message, 
 		ctx = context.Background()
 	}
 	requestCtx, cancel := deriveCancelableRequestContext(ctx)
-	defer cancel()
 
 	req, targetModel, err := buildUpstreamChatRequest(requestCtx, token, messages, model, stream, imageURLs, videoURLs, hasTools)
 	if err != nil {
+		cancel()
 		return nil, "", err
 	}
 
 	client, err := TLSHTTPClient(300 * time.Second)
 	if err != nil {
+		cancel()
 		return nil, "", err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		cancel()
 		return nil, "", err
+	}
+	if resp.Body != nil {
+		resp.Body = &cancelOnCloseReadCloser{
+			ReadCloser: resp.Body,
+			cancel:     cancel,
+		}
+	} else {
+		cancel()
 	}
 
 	LogDebug("Upstream response: status=%d", resp.StatusCode)
 	return resp, targetModel, nil
+}
+
+type cancelOnCloseReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (r *cancelOnCloseReadCloser) Close() error {
+	err := r.ReadCloser.Close()
+	if r.cancel != nil {
+		r.cancel()
+	}
+	return err
 }
 
 func buildUpstreamChatRequest(ctx context.Context, token string, messages []Message, model string, stream bool, imageURLs, videoURLs []string, hasTools bool) (*fhttp.Request, string, error) {
