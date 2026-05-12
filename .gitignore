@@ -38,6 +38,7 @@ main
 /data/*.db-*
 /data/*.sqlite
 /data/*.sqlite-*
+/data/backups/
 
 # Test files
 test.txt
