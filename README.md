@@ -207,6 +207,7 @@ print(response.choices[0].message.content)
 - 当前最小成功 header 是 `Authorization: Bearer <fresh user token>`、`Content-Type: application/json`、`X-FE-Version`。
 - 代理不再向聊天接口重放浏览器 query token、cookie、`X-Signature` 或旧 `captcha_verify_param`。
 - 如果部署机器直连 `chat.z.ai` 被边缘网络拦截，可设置 `UPSTREAM_PROXY` 让刷新 token、模型同步、文件上传和聊天请求统一走同一个出口。
+- 使用本仓库 Docker Compose 时，如果代理在宿主机上，可设置 `UPSTREAM_PROXY=http://host.docker.internal:7890`。
 - 即使上游请求体 `stream=false`，z.ai 当前仍返回 `text/event-stream`，所以非流式路径也按 SSE 汇总后再输出 OpenAI JSON。
 
 ## 项目结构
